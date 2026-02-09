@@ -1,0 +1,29 @@
+# Core dependencies for BleachDt
+# Install with: pip install -r requirements.txt
+# Or use: pip install bleachdt[all] for all features including GUI
+
+# Core scientific computing
+numpy>=1.19.0
+pandas>=1.0.0
+matplotlib>=3.3.0
+scipy>=1.5.0
+scikit-image>=0.17.0
+tifffile>=2020.9.3
+numba>=0.50.0
+opencv-python>=4.4.0
+
+# GUI dependencies (optional)
+# Uncomment to install GUI support:
+# pyqtgraph>=0.12.0
+# PySide6>=6.0.0
+
+# Additional format support (optional)
+# Uncomment for Nikon ND2 support:
+# nd2>=0.5.0
+# Uncomment for Zeiss CZI support:
+# aicsimageio>=4.0.0
+# aicspylibczi>=3.1.1
+# fsspec>=2022.8.0
+# Uncomment for Leica LIF support:
+# aicsimageio>=4.0.0
+# readlif>=0.6.4

@@ -1,0 +1,133 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bleachdt"
+version = "3.0.0"
+description = "BleachDt - A comprehensive toolkit for analyzing FRAP experiments in phase-separated droplets"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Andrew Bazley", email = "andrew.bazley@nyulangone.org"}
+]
+maintainers = [
+    {name = "Andrew Bazley", email = "andrew.bazley@nyulangone.org"}
+]
+keywords = [
+    "FRAP",
+    "fluorescence",
+    "photobleaching",
+    "diffusion",
+    "phase separation",
+    "droplets",
+    "biophysics",
+    "image analysis",
+    "microscopy",
+    "PDE fitting"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.7"
+dependencies = [
+    "numpy>=1.19.0",
+    "pandas>=1.0.0",
+    "matplotlib>=3.3.0",
+    "scipy>=1.5.0",
+    "scikit-image>=0.17.0",
+    "tifffile>=2020.9.3",
+    "numba>=0.50.0",
+    "opencv-python>=4.4.0",
+]
+
+[project.optional-dependencies]
+gui = [
+    "pyqtgraph>=0.12.0",
+    "PySide6>=6.0.0",
+]
+gui-pyqt6 = [
+    "pyqtgraph>=0.12.0",
+    "PyQt6>=6.0.0",
+]
+gui-pyqt5 = [
+    "pyqtgraph>=0.12.0",
+    "PyQt5>=5.15.0",
+]
+# Additional microscopy format support
+formats = [
+    "aicsimageio>=4.0.0",
+]
+zeiss = [
+    "aicsimageio>=4.0.0",
+    "aicspylibczi>=3.1.1",
+    "fsspec>=2022.8.0",
+]
+leica = [
+    "aicsimageio>=4.0.0",
+    "readlif>=0.6.4",
+]
+nikon = [
+    "nd2>=0.5.0",
+]
+bioformats = [
+    "aicsimageio>=4.0.0",
+    "bioformats_jar",
+]
+all-formats = [
+    "bleachdt[zeiss]",
+    "bleachdt[leica]",
+    "bleachdt[nikon]",
+]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.0.0",
+    "black>=21.0",
+    "flake8>=3.9.0",
+]
+all = [
+    "bleachdt[gui]",
+    "bleachdt[all-formats]",
+]
+
+[project.urls]
+Homepage = "https://github.com/andrewbazley/BleachDt"
+Documentation = "https://github.com/andrewbazley/BleachDt#readme"
+Repository = "https://github.com/andrewbazley/BleachDt.git"
+Issues = "https://github.com/andrewbazley/BleachDt/issues"
+
+[project.scripts]
+bleachdt-gui = "bleachdt.gui:main"
+bleachdt-analysis = "bleachdt.crop_pde:main"
+bleachdt-combine = "bleachdt.combine:main"
+bleachdt-crop = "bleachdt.droplet_crop:main"
+
+[project.gui-scripts]
+bleachdt = "bleachdt.gui:main"
+
+[tool.setuptools]
+packages = ["bleachdt"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+bleachdt = ["*.ijm"]
+
+[tool.black]
+line-length = 100
+target-version = ['py37', 'py38', 'py39', 'py310', 'py311']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

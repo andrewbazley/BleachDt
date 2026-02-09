@@ -1,0 +1,22 @@
+# Include documentation
+include README.md
+include LICENSE
+
+# Include configuration files
+include pyproject.toml
+include setup.py
+
+# Include all Python source files at root level (needed by bleachdt package wrappers)
+include *.py
+recursive-include bleachdt *.py
+
+# Exclude compiled files
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude *.so
+global-exclude .DS_Store
+
+# Exclude development files
+exclude .gitignore
+global-exclude .git
+global-exclude .github
