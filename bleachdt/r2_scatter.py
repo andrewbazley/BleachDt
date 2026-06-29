@@ -10,6 +10,7 @@ Reads all FRAP_condition_summary.csv files and calculates R^2 for:
 import os
 import glob
 import csv
+import argparse
 import numpy as np
 from scipy import stats
 
@@ -29,9 +30,21 @@ def calculate_r2(x, y):
     
     return r_squared, p_value
 
-def main():
-    base_dir = "/Volumes/Andrew/20251203 eBiP Mutants ATP ADP V4"
-    
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Calculate R^2 / p-values for FRAP scatter relationships "
+            "(k_single_exp vs pre_mean, K_pre, and bleach_fraction) across all "
+            "FRAP_condition_summary.csv files under a results directory."
+        )
+    )
+    parser.add_argument(
+        "base_dir",
+        help="Root directory containing <condition>/<*_results>/FRAP_condition_summary.csv files.",
+    )
+    args = parser.parse_args(argv)
+    base_dir = args.base_dir
+
     # Find all FRAP_condition_summary.csv files (handle both old "results" and new "*_results" folder names)
     pattern1 = os.path.join(base_dir, "*/*_results/FRAP_condition_summary.csv")
     pattern2 = os.path.join(base_dir, "*/results/FRAP_condition_summary.csv")

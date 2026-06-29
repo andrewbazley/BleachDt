@@ -3,7 +3,7 @@
 Generate a pre_mean vs droplet_radius plot, grouped by condition.
 
 This script searches a base directory recursively for `FRAP_condition_summary.csv`
-files (produced by `Crop_PDE_Cursor_V7.py`). It then:
+files (produced by `crop_pde.py` / `bleachdt-analysis`). It then:
   - filters rows to a selected model (default: "Separate")
   - groups rows by a derived "condition key" from the `filename` column
   - optionally filters brightness outliers within each condition (± N SD)
@@ -29,7 +29,10 @@ try:
 except Exception:
     scipy_stats = None
 
-from condition_utils import extract_condition_key, extract_replicate_id
+try:
+    from .condition_utils import extract_condition_key, extract_replicate_id
+except ImportError:
+    from condition_utils import extract_condition_key, extract_replicate_id
 
 
 Point = Tuple[float, float, Optional[str], Optional[str], str]  # (pre_mean, radius, rep, ligand, filename)

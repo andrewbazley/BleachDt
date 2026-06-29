@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <em>The name "BleachDt" (pronounced "bleached") is a nod to the PDE-based diffusion coefficient (D) fitting at the heart of this analysis.</em>
+  <em>The name "BleachDt" (pronounced "bleached") is a nod to the optional PDE-based diffusion coefficient (D) fitting.</em>
 </p>
 
 <p align="center">
@@ -21,12 +21,15 @@
 
 ## Features
 
-- **Automated Droplet Detection** — Identifies and crops individual droplets from multi-droplet image stacks
-- **PDE-Based Diffusion Fitting** — Fits diffusion coefficients using partial differential equation models
-- **Dual Model Support** — Choose between "Separate" (independent PDE + exponential) or "Combined" (constrained) fitting models
-- **Interactive GUI** — User-friendly interface with real-time scatter plot filtering
-- **Batch Processing** — Parallel processing across multiple conditions and experiments
-- **Automatic Configuration Saving** — Every run saves its parameters and log output for reproducibility
+- **Fiji-matched Stabilization** — Registers every frame to the pre-bleach frame on the whole-image **gradient magnitude**, exactly like Fiji's Image Stabilizer plugin. Verified against the ImageJ plugin's own transformation log: shifts agree to **~0.03 px**. The gradient-magnitude domain makes this robust to the bleach event and photobleaching (which are not motion). A single **subpixel** bilinear shift is applied to **all channels** (estimated from the analysis channel only), so a fixed ROI tracks the true droplet area across all frames. A `stabilization_shifts_*.csv` log is written for QC. (Optional `--exclude-bleach-from-stabilization` masks FRAP droplets for very sparse-droplet movies; off by default.)
+- **Automated Droplet Detection** — Identifies and crops individual droplets from multi-droplet image stacks, recording each droplet's X/Y location and geometry.
+- **PDE-Based Diffusion Fitting** — Fits diffusion coefficients using partial differential equation model to compensate for bimodal recovery that single exponential fitting obscures.
+- **Dual Normalization** — Computes BOTH the standard pre-bleach-frame normalization and the whole-droplet fluorescence per frame normalization. Raw integrated densities (RawIntDen) and both normalized curves are always saved; the GUI selects which is reported as the headline recovery curve.
+- **Dual Model Support** — Choose between "Separate" (independent PDE + exponential) or "Combined" (constrained) fitting models.
+- **Consolidated Outputs** — One per-movie `droplet_metrics.csv` merges FRAP, NoBleach, and droplet location/geometry.
+- **Interactive GUI** — User-friendly interface with real-time, re-runnable scatter-plot filtering.
+- **Batch Processing** — Parallel processing across multiple conditions and experiments.
+- **Automatic Configuration Saving** — Every run saves its parameters and log output for reproducibility.
 
 ---
 
@@ -107,7 +110,7 @@ pip install -e .[all]
 bleachdt-gui
 
 # Or run directly from source
-python combine_frap_curves_gui.py
+python -m bleachdt.gui
 ```
 
 ### Basic Workflow
@@ -137,12 +140,17 @@ The pipeline automatically detects the input type and processes accordingly:
 
 ## Pipeline Components
 
-| Script | Purpose |
-|--------|---------|
-| `combine_frap_curves_gui.py` | Main GUI application |
-| `Droplet_Crop.py` | Detects, crops, and stabilizes droplets from raw movies |
-| `Crop_PDE_Cursor_V7.py` | Core analysis engine for PDE fitting and curve extraction |
-| `combine_frap_curves.py` | Combines and filters FRAP curves across experiments |
+All functionality lives in a single `bleachdt` package. The core modules are:
+
+| Module | Console script | Purpose |
+|--------|----------------|---------|
+| `bleachdt.gui` | `bleachdt-gui` | Main GUI application (orchestrates the full pipeline) |
+| `bleachdt.droplet_crop` | `bleachdt-crop` | Detects, crops, and stabilizes droplets from raw movies |
+| `bleachdt.crop_pde` | `bleachdt-analysis` | Core analysis engine for PDE fitting and curve extraction |
+| `bleachdt.combine` | `bleachdt-combine` | Combines and filters FRAP curves across experiments |
+| `bleachdt.condition_utils` | — | Condition / replicate name extraction helpers |
+| `bleachdt.r2_scatter` | `bleachdt-r2` | R² summaries for FRAP scatter relationships |
+| `bleachdt.pre_mean_vs_radius` | `bleachdt-radius` | Pre-bleach mean intensity vs droplet radius analysis |
 
 ---
 
@@ -181,7 +189,7 @@ The Analysis tab contains collapsible sections for organized parameter control:
 </details>
 
 #### Droplet Cropping
-*Uses: `Droplet_Crop.py`*
+*Uses: `bleachdt.droplet_crop` (`bleachdt-crop`)*
 <details>
 <summary>Click to expand parameters</summary>
 
@@ -199,7 +207,7 @@ The Analysis tab contains collapsible sections for organized parameter control:
 </details>
 
 #### PDE Fitting
-*Uses: `Crop_PDE_Cursor_V7.py`*
+*Uses: `bleachdt.crop_pde` (`bleachdt-analysis`)*
 <details>
 <summary>Click to expand parameters</summary>
 
@@ -222,7 +230,7 @@ The Analysis tab contains collapsible sections for organized parameter control:
 </details>
 
 #### Detection Parameters
-*Uses: `combine_frap_curves.py`*
+*Uses: `bleachdt.combine` (`bleachdt-combine`)*
 
 These parameters control initial curve quality detection (not to be confused with user-defined filtering in the Filtering tab).
 
@@ -328,10 +336,10 @@ bleachdt-combine /path/to/results \
 <summary>Running from source (without pip install)</summary>
 
 ```bash
-python combine_frap_curves_gui.py                    # GUI
-python Crop_PDE_Cursor_V7.py /path/to/movies ...     # Full analysis
-python Droplet_Crop.py /path/to/movies ...           # Cropping
-python combine_frap_curves.py /path/to/results ...   # Combine curves
+python -m bleachdt.gui                              # GUI
+python -m bleachdt.crop_pde /path/to/movies ...     # Full analysis
+python -m bleachdt.droplet_crop /path/to/movies ... # Cropping
+python -m bleachdt.combine /path/to/results ...     # Combine curves
 ```
 
 </details>
@@ -367,8 +375,11 @@ Key features for HPC:
 |-----------|-------|-------------|
 | `D_um2_per_s` | µm²/s | Diffusion coefficient from PDE fitting |
 | `k_single_exp` | 1/s | Exponential recovery rate constant |
-| `mobile_fraction` | — | Fraction of mobile molecules (0–1) |
-| `immobile_fraction` | — | Fraction of immobile molecules (0–1) |
+| `half_time_s` | s | Recovery half-time, t½ = ln(2)/k |
+| `mobile_fraction` | — | **True** mobile fraction = (YM−Y0)/(1−Y0) computed on the whole-droplet-normalized curve, so it accounts for redistribution relative to the finite droplet pool (not just bleach depth). |
+| `immobile_fraction` | — | 1 − mobile_fraction |
+| `recovery_amplitude` | — | Raw recovered signal YM−Y0 (reported separately from the true mobile fraction) |
+| `mobile_fraction_basis` | — | Which curve the mobile fraction was derived from (`whole_droplet` or, as fallback, `fit_ROI`) |
 
 ### Droplet Properties
 
@@ -399,29 +410,68 @@ Key features for HPC:
 
 ---
 
+## Normalization & Raw Intensities
+
+BleachDt computes two FRAP normalizations for every bleach spot, both in true
+integrated-density (`RawIntDen`) space with explicit per-ROI background subtraction
+(matching the Fiji total-fluorescence macro):
+
+- **Pre-bleach frame** (`FRAP_norm_prebleach`): the classic FRAP **double normalization**.
+  The bleach-spot background-subtracted integrated density is corrected for acquisition
+  photobleaching using **in-field NoBleach reference droplets** (their mean intensity
+  normalized to the first frame) — never the bleached droplet itself — then normalized to
+  its own pre-bleach value. If no NoBleach reference is available the curve is left
+  uncorrected and flagged (`pb_source`). The uncorrected ratio and per-frame
+  `photobleach_factor` are also saved for transparency.
+
+Background is subtracted **per frame** from the non-droplet region (the conventional
+order: local background removed at each time point before normalization).
+- **Whole-droplet ratio** (`FRAP_norm_wholedroplet`): `(bleach / whole-droplet)`
+  background-subtracted, normalized to the pre-bleach ratio. Accounts for the droplet's
+  own total-fluorescence dynamics (e.g. condensate growth / influx).
+
+Both curves **and** the raw `RawIntDen` values (bleach + whole droplet) are *always*
+written to each movie's consolidated `FRAP_droplet_timeseries.csv`, so you can re-derive
+or re-filter anything later. In the GUI, **Image Stabilization → FRAP normalization**
+selects which curve is reported as the headline recovery curve (`prebleach`,
+`wholedroplet`, or `both`); on the command line use `--normalization-method`. The PDE
+diffusion fit is normalization-independent (it fits the spatial relaxation), so this
+choice does not change `D`.
+
+Drift is applied at subpixel precision by default (smooth registration; intensities are
+resampled once via bilinear interpolation). If you would rather preserve exact pixel
+values at the cost of up to ±0.5 px residual drift, enable **Whole-pixel apply** in the
+GUI or pass `--whole-pixel-stabilization` to `bleachdt-crop`.
+
 ## Output Files
 
 ### Per-Movie Outputs (`Analysis Results/[movie]_results/`)
 
 | File | Description |
 |------|-------------|
-| `stabilized_[movie].tif` | Stabilized whole-movie stack (when stabilization is on) |
-| `all_frap_curves.csv` | Individual recovery curves (columns = droplets) |
-| `FRAP_condition_summary.csv` | Fit parameters per droplet |
-| `NoBleach_summary.csv` | Control droplet measurements |
-| `NoBleach_summary.txt` | Movie-level classification |
-| `FRAP_curves.tif` | Visual plot of all curves |
-| `*_frap_fit_*.tif` | Diagnostic fit plots |
-| `droplet_stacks/` | (Optional) Cropped droplet TIF stacks; omitted if "Save droplet TIF stacks" is unchecked |
+| `stabilized_[movie].tif` | Stabilized whole-movie stack (when stabilization is on). Subpixel bilinear drift correction by default (smooth, faithful intensities; `--whole-pixel-stabilization` to preserve exact values instead). |
+| `stabilization_shifts_[movie].csv` | Per-frame drift log: `dy`, `dx`, shift magnitude, residual RMS, method, application mode — for QC / comparison against Fiji. |
+| `droplet_metrics.csv` | **The single consolidated metrics table.** Merges per-droplet FRAP fit parameters (incl. true `mobile_fraction`, `recovery_amplitude`, `half_time_s`), NoBleach control metrics, droplet X/Y location + geometry, and the scatter R²/p-values — one droplet-keyed row each. (`droplet_locations.csv` is folded in and removed.) |
+| `FRAP_droplet_timeseries.csv` | All **FRAP** droplets' per-frame curves in one long CSV (`droplet` column). Always includes raw bleach/droplet `RawIntDen`, BG-subtracted integrated density, the `photobleach_factor`, and **both** normalized curves. |
+| `NoBleach_droplet_timeseries.csv` | All **NoBleach** control droplets' per-frame K(t)/R(t) in one long CSV. |
+| `Pre-bleach_stacked_all.csv` / `Whole-droplet_stacked_all.csv` | All FRAP curves (unfiltered) per normalization method, **transposed**: one row per bleach point, one column per frame. |
+| `Pre-bleach_averaged_all.csv` / `Whole-droplet_averaged_all.csv` | Mean ± SEM recovery curve across bleach points, per normalization method. |
+| `FRAP_condition_summary.csv` / `NoBleach_summary.csv` | Per-droplet fit table / control table (retained for the Filtering tab; their data is also in `droplet_metrics.csv`). |
+| `droplet_stacks/` | (Optional) Cropped droplet TIF stacks; only written if "Save droplet TIF stacks" is checked. |
+
+Optional diagnostic plots (toggled by GUI checkboxes / CLI flags, applied per-movie and combined): `FRAP_frap_fit_separate.tif` (off), `FRAP_K_exp_scatters_combined.tif` (off), `FRAP_noise_pixels.tif` (off), `NoBleach_K_curves.tif` (on). The per-droplet `summary/` folder is no longer created.
 
 ### Combined Outputs (`Analysis Results/`)
 
 | File | Description |
 |------|-------------|
-| `stacked_all.csv` | All curves stacked with movie labels |
-| `averaged_all.csv` | Averaged curves per movie |
-| `FRAP_curves.tif` | Combined curves visualization |
-| `stacked_all_Filtered.xlsx` | Filtered curves (from Filtering tab) |
+| `droplet_metrics.csv` | Combined consolidated metrics table across all movies (adds a `movie` column). |
+| `Pre-bleach_stacked_all.csv` / `Whole-droplet_stacked_all.csv` | All FRAP curves across all movies (unfiltered), per normalization method, transposed (rows = bleach points, columns = frames). |
+| `Pre-bleach_averaged_all.csv` / `Whole-droplet_averaged_all.csv` | Mean ± SEM curve across all bleach points, per normalization method. |
+| `FRAP_condition_summary.csv` | Combined per-droplet fit summary (retained for the Filtering tab). |
+| `stacked_all_Filtered.xlsx` | Filtered curves (from Filtering tab). |
+
+> Eliminated: the combined `all_frap_curves.csv`, `stacked_all.csv`, `averaged_all.csv`, and the top-level `FRAP_curves.tif` overlay — superseded by the transposed per-normalization stacked + averaged CSVs above.
 
 ### Run Logs
 
