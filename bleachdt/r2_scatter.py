@@ -7,6 +7,8 @@ Reads all FRAP_condition_summary.csv files and calculates R^2 for:
 - k_single_exp vs bleach_fraction
 """
 
+from __future__ import annotations
+
 import os
 import glob
 import csv

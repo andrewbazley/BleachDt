@@ -74,6 +74,10 @@ Optional (for broader format support):
     pip install aicsimageio[bioformats]  # Full BioFormats support (requires Java)
 """
 
+# Defer annotation evaluation so PEP 604 union syntax (e.g. ``np.ndarray | None``) does
+# not error on Python 3.9 (where ``type | None`` is not yet a runtime operation).
+from __future__ import annotations
+
 import argparse
 import sys
 import warnings

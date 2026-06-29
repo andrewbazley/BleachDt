@@ -8,6 +8,8 @@ applies detection thresholds (drop/jump checks), and generates output CSVs:
 2. Averaged CSV: Each movie averaged, columns next to each other
 """
 
+from __future__ import annotations
+
 import os
 import argparse
 import glob

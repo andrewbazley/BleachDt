@@ -29,7 +29,7 @@ Or from the command line:
     $ bleachdt-crop /path/to/movies --stabilize
 """
 
-__version__ = "4.1.0"
+__version__ = "4.1.1"
 __author__ = "Andrew Bazley"
 __email__ = "andrew.bazley@nyulangone.org"
 

@@ -16,6 +16,8 @@ Key conventions:
 Defaults assume: 0.11 µm/pixel, 10 s frame interval.
 """
 
+from __future__ import annotations
+
 import os
 import glob
 import argparse
