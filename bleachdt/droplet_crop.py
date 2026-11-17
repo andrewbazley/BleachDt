@@ -100,7 +100,8 @@ try:
 except ImportError:
     AICSIMAGEIO_AVAILABLE = False
 
-from skimage import filters, morphology, measure, segmentation
+from skimage import filters, morphology, measure, segmentation, exposure
+from skimage.util import img_as_ubyte
 try:
     from skimage.registration import phase_cross_correlation as _phase_cross_correlation
 except Exception:  # pragma: no cover - very old skimage
@@ -294,7 +295,9 @@ def _read_stack_array(path: Path, verbose: bool = True) -> np.ndarray:
             
         elif reader_type == "nd2":
             nd2_success = False
-            
+            nd2_error = None
+            nd2_import_failed = False  # True => nd2 unusable; False => file read/parse error
+
             # First, try the nd2 library
             try:
                 import nd2
@@ -315,12 +318,19 @@ def _read_stack_array(path: Path, verbose: bool = True) -> np.ndarray:
                             print(f"  Interpreting Z as time dimension.")
                         # Data is already in correct order from f.asarray()
                         
-            except ImportError:
+            except ImportError as e:
+                # nd2 itself is unusable (e.g. NumPy ABI break: "numpy.core.multiarray
+                # failed to import" when nd2's compiled wheel predates the installed NumPy).
+                nd2_error = f"{type(e).__name__}: {e}"
+                nd2_import_failed = True
                 if verbose:
-                    print(f"  nd2 library not installed, trying aicsimageio...")
+                    print(f"  nd2 import failed ({nd2_error}); trying aicsimageio...")
             except Exception as e:
+                # nd2 imported fine but could not READ this file (corrupt/truncated ND2,
+                # e.g. "Invalid ChunkMap signature" from a zeroed file tail).
+                nd2_error = f"{type(e).__name__}: {e}"
                 if verbose:
-                    print(f"  nd2 library failed ({type(e).__name__}), trying aicsimageio fallback...")
+                    print(f"  nd2 read failed ({nd2_error}); trying aicsimageio fallback...")
             
             # Fallback to aicsimageio if nd2 failed
             if not nd2_success:
@@ -356,15 +366,41 @@ def _read_stack_array(path: Path, verbose: bool = True) -> np.ndarray:
                             f"Try opening in Fiji and re-saving as TIFF.\n"
                             f"{'='*60}\n"
                         )
-                else:
+                elif nd2_import_failed:
+                    # nd2 itself is broken/missing (not a file problem).
                     raise ImageImportError(
                         f"\n{'='*60}\n"
                         f"IMAGE IMPORT ERROR: ND2 support not available\n"
                         f"{'='*60}\n"
                         f"File: {path.name}\n\n"
-                        f"ND2 (Nikon) files require either:\n"
-                        f"  - pip install nd2\n"
-                        f"  - pip install aicsimageio\n"
+                        f"The 'nd2' library could not be imported:\n"
+                        f"    {nd2_error or 'not installed'}\n\n"
+                        f"If nd2 WAS working before, this is almost always a NumPy ABI\n"
+                        f"mismatch (nd2's compiled wheel vs the installed NumPy). Fixes\n"
+                        f"(run with the SAME interpreter that launches the GUI):\n"
+                        f"  - Reinstall against the current NumPy:  python -m pip install -U --force-reinstall nd2\n"
+                        f"  - Or pin NumPy:                         python -m pip install 'numpy<2'\n"
+                        f"  - Or install a fallback reader:         python -m pip install aicsimageio\n"
+                        f"{'='*60}\n"
+                    )
+                else:
+                    # nd2 works; THIS FILE could not be read -> corrupt / truncated ND2.
+                    raise ImageImportError(
+                        f"\n{'='*60}\n"
+                        f"IMAGE IMPORT ERROR: ND2 file could not be read (likely corrupt)\n"
+                        f"{'='*60}\n"
+                        f"File: {path.name}\n\n"
+                        f"nd2 is installed and working, but could not parse this file:\n"
+                        f"    {nd2_error}\n\n"
+                        f"An all-zero 'ChunkMap signature' means the ND2's index (stored at\n"
+                        f"the end of the file) is blank -- the file is truncated or was only\n"
+                        f"partially written/copied. Things to check:\n"
+                        f"  - Is the file fully copied onto the volume (not a cloud/online-only\n"
+                        f"    placeholder, not an interrupted transfer)? Compare its size to a\n"
+                        f"    known-good ND2 from the same acquisition.\n"
+                        f"  - Does it open in Fiji / NIS-Elements? If not, re-export or re-copy\n"
+                        f"    from the original source.\n"
+                        f"The rest of the batch is unaffected; this one file is the problem.\n"
                         f"{'='*60}\n"
                     )
             
@@ -471,6 +507,124 @@ def _read_stack_array(path: Path, verbose: bool = True) -> np.ndarray:
     return np.asarray(data)
 
 
+def parse_timing_segments(spec: str, n_frames: int = None):
+    """Parse a variable-timing spec like ``"300x0.1, 35x10"`` (or ``"300@0.1;35@10"``)
+    into a per-frame time array in seconds (cumulative, first frame at t=0).
+
+    Each segment is ``COUNT x INTERVAL`` meaning COUNT frames spaced INTERVAL seconds
+    apart. The first frame of the whole movie is t=0; thereafter each new frame advances
+    by its segment's interval. If ``n_frames`` is given, the result is truncated or the
+    last interval is extended to cover any extra frames. Returns None on a bad spec.
+    """
+    if not spec:
+        return None
+    import re
+    segments = []
+    for part in re.split(r"[,;]", str(spec)):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r"^\s*(\d+)\s*[x@*]\s*([0-9]*\.?[0-9]+)\s*$", part)
+        if not m:
+            return None
+        segments.append((int(m.group(1)), float(m.group(2))))
+    if not segments:
+        return None
+    times = []
+    first = True
+    for count, interval in segments:
+        for _ in range(count):
+            if first:
+                times.append(0.0)   # first frame of the movie is t=0
+                first = False
+            else:
+                times.append(times[-1] + interval)
+    times = np.asarray(times, dtype=np.float64)
+    if n_frames is not None and n_frames > 0:
+        if len(times) >= n_frames:
+            times = times[:n_frames]
+        else:
+            last_dt = segments[-1][1]
+            extra = np.arange(1, n_frames - len(times) + 1) * last_dt + times[-1]
+            times = np.concatenate([times, extra])
+    return times
+
+
+def read_frame_times_from_metadata(path: Path, n_frames: int = None, verbose: bool = False):
+    """Best-effort read of per-frame acquisition timestamps (seconds, first frame = 0).
+
+    Supports Nikon ND2 (via the ``nd2`` package, per-frame ``T`` timestamps) and
+    OME-TIFF / ImageJ TIFFs (via ``tifffile``: OME ``Plane DeltaT`` or the ImageJ
+    ``finterval``/``Info`` tags). Returns a float array or None if timing can't be read.
+    Never raises.
+    """
+    p = Path(path)
+    ext = p.suffix.lower()
+    try:
+        if ext == ".nd2":
+            try:
+                import nd2  # type: ignore
+            except Exception:
+                if verbose:
+                    print("  (ND2 timing: 'nd2' package not installed; skipping metadata.)")
+                return None
+            try:
+                with nd2.ND2File(str(p)) as f:
+                    # Per-frame experiment time in ms is exposed on the frame metadata.
+                    tv = []
+                    n = f.shape[0] if getattr(f, "shape", None) else (n_frames or 0)
+                    for i in range(n):
+                        try:
+                            fm = f.frame_metadata(i)
+                            ch = fm.channels[0]
+                            tv.append(float(ch.time.relativeTimeMs) / 1000.0)
+                        except Exception:
+                            tv = []
+                            break
+                    if tv:
+                        tv = np.asarray(tv, dtype=np.float64)
+                        return tv - tv[0]
+            except Exception:
+                return None
+            return None
+        elif ext in (".tif", ".tiff"):
+            import tifffile
+            with tifffile.TiffFile(str(p)) as tf:
+                # OME-TIFF: per-plane DeltaT.
+                ome = getattr(tf, "ome_metadata", None)
+                if ome:
+                    import re
+                    dts = re.findall(r'DeltaT="([0-9eE+\-.]+)"', ome)
+                    if len(dts) >= 2:
+                        tv = np.asarray([float(x) for x in dts], dtype=np.float64)
+                        return tv - tv[0]
+                # ImageJ: constant finterval (seconds) or per-frame in 'Info'.
+                ij = getattr(tf, "imagej_metadata", None)
+                if ij:
+                    if "finterval" in ij and n_frames:
+                        dt = float(ij["finterval"])
+                        if dt > 0:
+                            return np.arange(n_frames, dtype=np.float64) * dt
+        return None
+    except Exception:
+        return None
+
+
+def resolve_frame_times(path: Path, n_frames: int, frame_interval: float,
+                        timing_segments: str = "", verbose: bool = False):
+    """Resolve a per-frame time axis (seconds) using the agreed precedence:
+    (1) acquisition metadata, (2) an explicit multi-segment spec, (3) constant
+    ``frame_interval``. Returns ``(times, source)``."""
+    tv = read_frame_times_from_metadata(path, n_frames=n_frames, verbose=verbose)
+    if tv is not None and len(tv) >= n_frames:
+        return np.asarray(tv[:n_frames], dtype=np.float64), "metadata"
+    if timing_segments:
+        seg = parse_timing_segments(timing_segments, n_frames=n_frames)
+        if seg is not None and len(seg) >= n_frames:
+            return np.asarray(seg[:n_frames], dtype=np.float64), "segments"
+    return np.arange(n_frames, dtype=np.float64) * float(frame_interval), "constant_interval"
+
+
 def load_stack(path: Path, verbose: bool = True) -> np.ndarray:
     """
     Load an image stack as a 3D array (T, Y, X), float32.
@@ -555,9 +709,27 @@ def detect_droplets_prebleach(
     morph_open_radius: int = 1,
     smooth_sigma: float = 1.0,
     clear_borders: bool = True,
+    pixel_size: float = 0.0,
+    detect_blur_um: float = 0.0,
 ):
     """
     Detect droplets on the pre-bleach frame (frame 0).
+
+    The pre-bleach frame passed in here is the STABILIZED analysis-channel average.
+    To mirror the hand-analysis Fiji macro (and to keep a single *global* threshold
+    robust across fields that mix bright and dim droplets), the image is first rescaled
+    to 8-bit, Gaussian-blurred, then thresholded with IsoData. Working in 8-bit gives the
+    same coarse 256-bin histogram the macro's "Auto Threshold -> Default" sees, so large
+    bright droplets no longer skew a float histogram and drop out of the mask.
+
+    Parameters
+    ----------
+    pixel_size : float
+        Micron/pixel. When > 0 together with ``detect_blur_um``, the Gaussian sigma is
+        sized physically (sigma_px = detect_blur_um / pixel_size).
+    detect_blur_um : float
+        Pre-threshold Gaussian blur in microns (e.g. 1.0). Falls back to ``smooth_sigma``
+        (in pixels) when pixel size is unavailable.
 
     Returns:
       labels  : 2D int array
@@ -565,14 +737,37 @@ def detect_droplets_prebleach(
     """
     img = frame0.astype(np.float32)
 
-    # Optional Gaussian smoothing before threshold
-    if smooth_sigma > 0:
-        img_smooth = filters.gaussian(img, sigma=smooth_sigma)
+    # 8-bit conversion for thresholding (intensity_image below stays on the float
+    # original so partition coefficients / mean intensities are unaffected).
+    finite = img[np.isfinite(img)]
+    if finite.size and float(finite.max()) > float(finite.min()):
+        img8 = img_as_ubyte(
+            exposure.rescale_intensity(
+                img, in_range=(float(finite.min()), float(finite.max())),
+                out_range=(0.0, 1.0),
+            )
+        )
     else:
-        img_smooth = img
+        img8 = np.zeros_like(img, dtype=np.uint8)
 
-    # Threshold for bright droplets
-    thresh = filters.threshold_otsu(img_smooth)
+    # Gaussian smoothing before threshold. Prefer a physical (micron) sigma so the blur
+    # is ~1 um regardless of magnification; fall back to smooth_sigma in pixels.
+    if detect_blur_um and detect_blur_um > 0 and pixel_size and pixel_size > 0:
+        sigma_px = float(detect_blur_um) / float(pixel_size)
+    else:
+        sigma_px = float(smooth_sigma)
+    if sigma_px > 0:
+        img_smooth = filters.gaussian(img8, sigma=sigma_px, preserve_range=True)
+    else:
+        img_smooth = img8.astype(np.float32)
+
+    # Threshold for bright droplets. IsoData matches the hand-analysis macro's
+    # "Auto Threshold -> Default (dark)" on the pre-bleach average; fall back to Otsu if the
+    # IsoData estimate is degenerate.
+    try:
+        thresh = filters.threshold_isodata(img_smooth)
+    except Exception:
+        thresh = filters.threshold_otsu(img_smooth)
     mask = img_smooth > thresh
 
     # Morphological opening to clean speckles / thin bridges
@@ -649,6 +844,95 @@ def classify_droplets_frap_vs_nobleach(
         else:
             classes[lab] = "FRAP" if rmean > bleach_threshold else "NoBleach"
     return classes
+
+
+def classify_droplets_by_bleach_spots(
+    labels: np.ndarray,
+    regions,
+    ratio_image: np.ndarray,
+    ratio_blur_sigma: float = 2.0,
+    bleach_threshold: float = 1.1,
+    spot_min_area: float = 5.0,
+    adaptive_threshold: bool = True,
+    ratio_floor: bool = True,
+    min_bleach_depth: float = 0.3,
+) -> "tuple[dict[int, str], np.ndarray, dict[int, float], dict[int, float]]":
+    """Spot-based FRAP classification.
+
+    A bleach point is a *localized* region where fluorescence dropped substantially after
+    the bleach, i.e. where the pre/post ratio image is high. We threshold the (blurred)
+    ratio image to find bleach spots, drop specks below ``spot_min_area``, then assign each
+    spot to the droplet body it overlaps most. A droplet a bleach spot lands on is **FRAP**
+    (regardless of its size or shape); every other droplet is **NoBleach**.
+
+    Thresholding (mirrors the hand-analysis macro's "Auto Threshold -> Default"): when
+    ``adaptive_threshold`` is True (default) an IsoData threshold is computed on the blurred
+    ratio image, which finds the valley between the acquisition-photobleaching population
+    (pre/post ~1.0-1.2, whole field) and the strongly bleached spot. ``bleach_threshold``
+    then acts as an optional *floor* (``ratio_floor``, default on). With
+    ``adaptive_threshold=False`` the fixed ``bleach_threshold`` is used directly.
+
+    **Minimum bleach depth** (``min_bleach_depth``, default 0.3): a real bleach is a *large*
+    localized intensity drop; ordinary acquisition photobleaching is a small one. A droplet
+    is only called FRAP if the mean fractional drop across its assigned spot,
+    ``depth = 1 - post/pre = 1 - 1/mean_ratio``, is at least ``min_bleach_depth``. This is
+    also folded into the pixel cutoff as a floor (``1/(1-depth)``) so mild-drop pixels never
+    even form a spot -- the single most effective guard against calling every
+    mildly-photobleaching droplet FRAP. Set to 0 to disable.
+
+    Returns ``(classes, spot_labels, overlap_frac, bleach_depth)`` where ``bleach_depth``
+    maps a FRAP droplet label -> its measured fractional bleach depth (QC).
+    """
+    ratio_smooth = filters.gaussian(ratio_image, sigma=ratio_blur_sigma) if ratio_blur_sigma > 0 else ratio_image
+
+    # Effective spot cutoff: adaptive IsoData (auto valley) with the fixed value as a floor,
+    # and a floor from the minimum bleach depth (depth d <-> ratio >= 1/(1-d)).
+    thr = float(bleach_threshold)
+    if adaptive_threshold:
+        finite = ratio_smooth[np.isfinite(ratio_smooth)]
+        if finite.size > 0 and np.ptp(finite) > 0:
+            try:
+                iso = float(filters.threshold_isodata(finite))
+            except Exception:
+                iso = thr
+            thr = max(iso, thr) if ratio_floor else iso
+    if min_bleach_depth and 0.0 < min_bleach_depth < 1.0:
+        thr = max(thr, 1.0 / (1.0 - float(min_bleach_depth)))
+
+    # Bleach spots = connected regions where pre/post ratio exceeds the effective cutoff.
+    spot_mask = ratio_smooth > thr
+    if spot_min_area and spot_min_area > 0:
+        spot_mask = morphology.remove_small_objects(spot_mask, min_size=int(spot_min_area))
+    spot_labels = measure.label(spot_mask)
+
+    classes = {reg.label: "NoBleach" for reg in regions}
+    overlap_frac: dict[int, float] = {}
+    bleach_depth: dict[int, float] = {}
+    if spot_labels.max() == 0:
+        return classes, spot_labels, overlap_frac, bleach_depth
+
+    # Assign each bleach spot to the droplet label it overlaps most (mutual overlap of the
+    # bleach point on the nearest droplet body), then confirm the spot's mean depth.
+    for spot in measure.regionprops(spot_labels):
+        coords = spot.coords  # (N, 2) pixel coordinates of this spot
+        drop_labels_here = labels[coords[:, 0], coords[:, 1]]
+        on_drop = drop_labels_here > 0
+        if not np.any(on_drop):
+            continue  # spot not sitting on any detected droplet body
+        vals, counts = np.unique(drop_labels_here[on_drop], return_counts=True)
+        best = int(vals[int(np.argmax(counts))])
+        # Mean fractional drop over the spot pixels that fall on this droplet.
+        sel = coords[on_drop]
+        r = ratio_smooth[sel[:, 0], sel[:, 1]]
+        r = r[np.isfinite(r) & (r > 0)]
+        depth = float(1.0 - 1.0 / np.mean(r)) if r.size else 0.0
+        if min_bleach_depth and depth < float(min_bleach_depth):
+            continue  # localized drop too small -> photobleaching, not a bleach point
+        frac = float(counts.max()) / float(spot.area)
+        classes[best] = "FRAP"
+        overlap_frac[best] = max(overlap_frac.get(best, 0.0), frac)
+        bleach_depth[best] = max(bleach_depth.get(best, 0.0), depth)
+    return classes, spot_labels, overlap_frac, bleach_depth
 
 
 # --------------- PARTITION COEFFICIENT ----------------- #
@@ -1445,6 +1729,63 @@ def stabilize_stack_translation_ecc(
     return stabilized, shifts
 
 
+# ----------------- STABILIZATION FRAME-RANGE HELPERS ----------------- #
+
+def _resolve_stab_range(T: int, start: int, end: int) -> "tuple[int, int, bool]":
+    """Clamp a requested [start, end] stabilization frame range to a valid window.
+    ``end < 0`` means 'through the last frame'. Returns ``(start, end, is_full)`` where
+    ``is_full`` is True when the range covers the whole stack (estimate every frame, i.e.
+    the original behavior)."""
+    s = max(0, int(start))
+    e = (T - 1) if (end is None or int(end) < 0) else min(int(end), T - 1)
+    if e < s:
+        e = T - 1
+    is_full = (s <= 0 and e >= T - 1)
+    return s, e, is_full
+
+
+def _expand_range_shifts(idxs, sub_shifts, sub_resids, T, extrapolation="hold"):
+    """Expand shifts estimated at a sparse set of frames (``idxs``, always including frame 0
+    as the reference) into a continuous (T, 2) per-frame trajectory applied to the whole
+    stack. Interpolation keeps everything aligned to frame 0 with no discontinuity at the
+    range boundaries (the 'tail jump' problem).
+
+    extrapolation outside the estimated span:
+      - "hold" (default): repeat the nearest estimated shift (flat) -> jump-free.
+      - "linear": continue the end slope.
+      - "poly": fit a low-order polynomial drift model to the samples and evaluate it
+                everywhere (smoothest; good for monotonic thermal drift).
+    """
+    idxs = np.asarray(idxs, dtype=float)
+    xs = np.arange(T, dtype=float)
+    full = np.zeros((T, 2), dtype=np.float32)
+    sub_shifts = np.asarray(sub_shifts, dtype=float)
+    for k in range(2):
+        fp = sub_shifts[:, k]
+        if extrapolation == "poly" and len(idxs) >= 3:
+            deg = min(2, len(idxs) - 1)
+            full[:, k] = np.polyval(np.polyfit(idxs, fp, deg), xs)
+            continue
+        vals = np.interp(xs, idxs, fp)  # linear between samples, flat ('hold') outside
+        if extrapolation == "linear" and len(idxs) >= 2:
+            lo, hi = idxs[0], idxs[-1]
+            if lo > 0 and idxs[1] != idxs[0]:
+                m = (fp[1] - fp[0]) / (idxs[1] - idxs[0])
+                pre = xs < lo
+                vals[pre] = fp[0] + m * (xs[pre] - lo)
+            if hi < T - 1 and idxs[-1] != idxs[-2]:
+                m = (fp[-1] - fp[-2]) / (idxs[-1] - idxs[-2])
+                post = xs > hi
+                vals[post] = fp[-1] + m * (xs[post] - hi)
+        full[:, k] = vals
+    resids = np.zeros(T, dtype=np.float32)
+    if sub_resids is not None:
+        for j, gi in enumerate(np.asarray(idxs, dtype=int)):
+            if 0 <= gi < T and j < len(sub_resids):
+                resids[gi] = sub_resids[j]
+    return full, resids
+
+
 # ----------------- MAIN PROCESSING ----------------- #
 
 def process_stack_file(
@@ -1453,8 +1794,8 @@ def process_stack_file(
     min_area: float = 50.0,
     morph_open_radius: int = 1,
     smooth_sigma: float = 1.0,
-    clear_borders: bool = True,
-    ratio_blur_sigma: float = 1.0,
+    clear_borders: bool = False,
+    ratio_blur_sigma: float = 2.0,
     bleach_threshold: float = 1.2,
     crop_multiplier: float = 2.0,
     max_iterations: int = 1000,
@@ -1465,8 +1806,8 @@ def process_stack_file(
     max_shift_pixels: float = 25.0,
     min_correlation: float = 0.7,
     refine_iterations: int = 1,
-    min_nobleach_diameter: float = 10.0,
-    min_nobleach_pc: float = 10.0,
+    min_nobleach_diameter: float = 0.0,
+    min_nobleach_pc: float = 0.0,
     no_stabilization: bool = False,
     use_lucas_kanade: bool = False,
     verbose: bool = True,
@@ -1474,6 +1815,18 @@ def process_stack_file(
     subpixel_apply: bool = True,
     exclude_bleach_from_stab: bool = False,
     pre_bleach_frames: int = 1,
+    bleach_spot_min_area: float = 5.0,
+    min_bleach_depth: float = 0.3,
+    stabilize_frame_start: int = 0,
+    stabilize_frame_end: int = -1,
+    stabilize_extrapolation: str = "hold",
+    frame_interval: float = 1.0,
+    timing_segments: str = "",
+    pixel_size: float = 0.0,
+    detect_blur_um: float = 0.0,
+    min_pc: float = 0.0,
+    min_diameter: float = 0.0,
+    save_threshold_masks: bool = False,
 ) -> int:
     """
     Process a single movie file:
@@ -1514,6 +1867,29 @@ def process_stack_file(
             print("  Skipping: needs at least 2 frames for frame0/frame1 ratio.")
         return 0
 
+    # Resolve the per-frame time axis (metadata -> segments -> constant interval) and write
+    # a *_frame_times.csv sidecar into the movie results folder. The analysis stage reads
+    # this so a variable acquisition cadence (e.g. a 100 ms burst then 10 s sampling) flows
+    # correctly into the reported time_s column and the time-aware fits.
+    try:
+        frame_times, time_src = resolve_frame_times(
+            input_path, T, frame_interval, timing_segments=timing_segments, verbose=verbose)
+        results_dir = movie_out_dir.parent
+        results_dir.mkdir(parents=True, exist_ok=True)
+        import csv as _csv_t
+        ft_path = results_dir / f"{input_path.stem}_frame_times.csv"
+        with open(ft_path, "w", newline="") as f_ft:
+            wt = _csv_t.writer(f_ft)
+            wt.writerow(["frame", "time_s"])
+            for i in range(T):
+                wt.writerow([i, f"{float(frame_times[i]):.6f}"])
+        if verbose:
+            print(f"  Wrote frame time axis ({time_src}): {ft_path.name} "
+                  f"(t0={frame_times[0]:.3f}s .. t{T-1}={frame_times[-1]:.3f}s)")
+    except Exception as e:
+        if verbose:
+            print(f"  (Could not write frame-times sidecar: {e})")
+
     # Step 1: Stabilize whole movie (shifts from analysis channel, applied to all channels)
     if no_stabilization:
         stack_work = stack_tc
@@ -1524,6 +1900,23 @@ def process_stack_file(
         ref = stack_tc[:, ach, :, :].astype(np.float32)
         stab_method = "ecc" if not use_lucas_kanade else "gradient"
         resids = None
+
+        # Frame-range stabilization: estimate drift only on frame 0 (the reference) plus
+        # the requested [start, end] window, then expand to a continuous whole-stack
+        # trajectory (see _expand_range_shifts). Keeps everything aligned to the first
+        # frame(s) and avoids the tail-jump discontinuity. If the range covers the whole
+        # stack, we estimate every frame exactly as before.
+        s_range, e_range, full_range = _resolve_stab_range(
+            ref.shape[0], stabilize_frame_start, stabilize_frame_end)
+        if full_range:
+            stab_idxs = np.arange(ref.shape[0])
+        else:
+            stab_idxs = np.array(sorted(set([0]) | set(range(s_range, e_range + 1))), dtype=int)
+            if verbose:
+                print(f"  Range stabilization: estimating {len(stab_idxs)} frame(s) "
+                      f"(frame 0 + [{s_range}, {e_range}]) of {ref.shape[0]}, "
+                      f"extrapolation='{stabilize_extrapolation}'.")
+        ref_est = ref[stab_idxs]
         if use_lucas_kanade:
             # Default path: whole-image gradient-magnitude registration to frame 0,
             # exactly like Fiji's Image Stabilizer (verified to agree with the ImageJ
@@ -1540,14 +1933,14 @@ def process_stack_file(
                     ratio_blur_sigma=ratio_blur_sigma, bleach_threshold=bleach_threshold,
                     verbose=verbose,
                 )
-            shifts, resids = stabilize_stack_gradient(
-                ref, valid_mask=reg_mask,
+            sub_shifts, sub_resids = stabilize_stack_gradient(
+                ref_est, valid_mask=reg_mask,
                 refine_iters=max(4, min(int(max_iterations), 30)),
                 max_shift_pixels=max_shift_pixels, verbose=verbose,
             )
         else:
-            _, shifts = stabilize_stack_translation_ecc(
-                ref,
+            _, sub_shifts = stabilize_stack_translation_ecc(
+                ref_est,
                 max_iterations=max_iterations,
                 epsilon=epsilon,
                 template_update_coeff=template_update_coeff,
@@ -1557,6 +1950,16 @@ def process_stack_file(
                 min_correlation=min_correlation,
                 refine_iterations=refine_iterations,
             )
+            sub_resids = None
+
+        # Expand the (possibly sparse) estimated shifts to a continuous whole-stack
+        # trajectory aligned to frame 0. When the range is full this is a no-op mapping.
+        if full_range:
+            shifts, resids = sub_shifts, sub_resids
+        else:
+            shifts, resids = _expand_range_shifts(
+                stab_idxs, sub_shifts, sub_resids, T, stabilize_extrapolation)
+
         # Apply the SAME shift to every channel, once, with subpixel bilinear
         # interpolation by default (smooth registration faithful to intensity changes).
         stack_work = apply_shifts_to_tc(stack_tc, shifts, subpixel=subpixel_apply)
@@ -1589,18 +1992,24 @@ def process_stack_file(
                 print(f"  Saved stabilized whole-movie stack: {stabilized_whole_path.name} "
                       f"(could not write shift log: {e})")
 
-    # Pre-bleach = last pre-bleach frame; post-bleach = first post-bleach frame.
+    # Pre-bleach baseline = MEAN of the first N pre-bleach frames (not just the last one);
+    # post-bleach = first post-bleach frame. Averaging the pre-bleach frames denoises the
+    # detection / ratio / partition-coefficient stage and matches the analysis baseline.
     first_post = max(1, min(int(pre_bleach_frames), T - 1))
-    frame0 = stack_work[first_post - 1, ach]
+    pre_frames = stack_work[:first_post, ach]
+    frame0 = pre_frames.mean(axis=0) if pre_frames.shape[0] > 0 else stack_work[first_post - 1, ach]
     frame1 = stack_work[first_post, ach]
 
-    # Detect droplets on pre-bleach frame (from stabilized stack)
+    # Detect droplets on the (averaged) pre-bleach frame. clear_borders now defaults OFF so
+    # large droplets near the image edge are kept (flagged via touches_image_edge instead).
     labels, regions = detect_droplets_prebleach(
         frame0,
         min_area=min_area,
         morph_open_radius=morph_open_radius,
         smooth_sigma=smooth_sigma,
         clear_borders=clear_borders,
+        pixel_size=pixel_size,
+        detect_blur_um=detect_blur_um,
     )
 
     if len(regions) == 0:
@@ -1614,18 +2023,54 @@ def process_stack_file(
     # Partition coefficients (signal/noise)
     pcs = compute_partition_coefficients(frame0, labels, regions)
 
-    # Ratio-based FRAP classification (frame0/frame1)
+    # Spot-based FRAP classification: threshold the pre/post ratio to find localized bleach
+    # spots and assign each to the droplet body it overlaps. FRAP = droplet carrying a spot
+    # (size/shape independent); everything else NoBleach.
     ratio_img = compute_ratio_frame(frame0, frame1)
-    classes = classify_droplets_frap_vs_nobleach(
+    classes, spot_labels, spot_overlap, spot_depth = classify_droplets_by_bleach_spots(
         labels,
         regions,
         ratio_img,
         ratio_blur_sigma=ratio_blur_sigma,
         bleach_threshold=bleach_threshold,
+        spot_min_area=bleach_spot_min_area,
+        min_bleach_depth=min_bleach_depth,
     )
+    if verbose:
+        n_frap = sum(1 for c in classes.values() if c == "FRAP")
+        print(f"  Bleach spots found: {int(spot_labels.max())}; "
+              f"FRAP droplets: {n_frap}, NoBleach: {len(classes) - n_frap} "
+              f"(min bleach depth {min_bleach_depth:.0%})")
 
     movie_stem = input_path.stem
     movie_out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional QC output: whole-field-of-view thresholding masks (like the Fiji macro's
+    # threshold check). This is distinct from FRAP_droplet_masks.tif (per-droplet crops):
+    # a 3-plane uint8 stack over the full FOV = [8-bit detection image, droplet threshold,
+    # bleach-spot threshold] so thresholding quality can be eyeballed at a glance.
+    if save_threshold_masks:
+        try:
+            det = frame0.astype(np.float32)
+            fin = det[np.isfinite(det)]
+            if fin.size and float(fin.max()) > float(fin.min()):
+                det8 = img_as_ubyte(exposure.rescale_intensity(
+                    det, in_range=(float(fin.min()), float(fin.max())), out_range=(0.0, 1.0)))
+            else:
+                det8 = np.zeros_like(det, dtype=np.uint8)
+            drop_mask8 = ((labels > 0).astype(np.uint8)) * 255
+            spot_mask8 = ((spot_labels > 0).astype(np.uint8)) * 255
+            qc_stack = np.stack([det8, drop_mask8, spot_mask8], axis=0)
+            qc_dir = movie_out_dir.parent
+            qc_dir.mkdir(parents=True, exist_ok=True)
+            qc_path = qc_dir / f"threshold_masks_{movie_stem}.tif"
+            save_stack_tiff(qc_path, qc_stack)
+            if verbose:
+                print(f"  Saved threshold QC masks: {qc_path.name} "
+                      f"(planes: detection 8-bit, droplet mask, bleach-spot mask)")
+        except Exception as e:
+            if verbose:
+                print(f"  Warning: could not write threshold QC masks: {e}")
 
     droplet_count = 0
     # Per-droplet location + geometry records (centroids are in full-frame, post-
@@ -1639,7 +2084,10 @@ def process_stack_file(
         pc = pcs.get(label, np.nan)
         equiv_d = float(region.equivalent_diameter)
 
-        # Crop from stabilized (or original) stack - no per-crop stabilization
+        # Crop from stabilized (or original) stack - no per-crop stabilization.
+        # We no longer reject a droplet because a NEIGHBOR touches the crop window
+        # (that check killed nearly every NoBleach reference in dense fields); every
+        # detected droplet is kept and cropped.
         cropped, border_has_labels = crop_stack_around_region_tc(
             stack_work,
             region,
@@ -1647,20 +2095,31 @@ def process_stack_file(
             labels=labels,
         )
 
-        # Apply NoBleach filters: size, partition coefficient, border labels
-        if class_label == "NoBleach":
-            if np.isnan(pc) or pc < min_nobleach_pc or equiv_d < min_nobleach_diameter:
+        # Whether this droplet's OWN body runs off the image edge (truncated data). Kept,
+        # but flagged so it can be filtered downstream instead of silently dropped.
+        min_row, min_col, max_row, max_col = region.bbox
+        touches_image_edge = bool(
+            min_row <= 0 or min_col <= 0 or max_row >= H or max_col >= W)
+
+        # General quality gates applied to EVERY droplet (FRAP and NoBleach): minimum
+        # partition coefficient and minimum equivalent diameter. Defaults are 0 (keep all).
+        if min_pc > 0 or min_diameter > 0:
+            if (np.isnan(pc) and min_pc > 0) or pc < min_pc or equiv_d < min_diameter:
                 if verbose:
                     print(
-                        f"    Skipping NoBleach droplet {idx:03d} "
-                        f"(equiv_d={equiv_d:.2f}, PC={pc:.2f})"
+                        f"    Skipping {class_label} droplet {idx:03d} "
+                        f"(equiv_d={equiv_d:.2f}, PC={pc:.2f}; below PC/size gate)"
                     )
                 continue
-            if border_has_labels:
+
+        # Optional NoBleach-only quality gates (kept for backward compatibility). Default
+        # thresholds are 0 (keep everything).
+        if class_label == "NoBleach" and (min_nobleach_pc > 0 or min_nobleach_diameter > 0):
+            if (np.isnan(pc) and min_nobleach_pc > 0) or pc < min_nobleach_pc or equiv_d < min_nobleach_diameter:
                 if verbose:
                     print(
                         f"    Skipping NoBleach droplet {idx:03d} "
-                        f"(droplet(s) touching crop border)"
+                        f"(equiv_d={equiv_d:.2f}, PC={pc:.2f}; below quality gate)"
                     )
                 continue
 
@@ -1702,6 +2161,9 @@ def process_stack_file(
             "circularity": round(circularity, 4) if np.isfinite(circularity) else "nan",
             "eccentricity": round(eccentricity, 4) if np.isfinite(eccentricity) else "nan",
             "partition_coefficient": round(float(pc), 4) if np.isfinite(pc) else "nan",
+            "touches_image_edge": int(touches_image_edge),
+            "bleach_spot_overlap": round(float(spot_overlap.get(label, 0.0)), 4),
+            "bleach_depth": round(float(spot_depth.get(label, 0.0)), 4),
         })
 
         droplet_count += 1
@@ -1763,6 +2225,18 @@ def _process_file_wrapper(args_tuple):
         subpixel_apply,
         exclude_bleach_from_stab,
         pre_bleach_frames,
+        bleach_spot_min_area,
+        min_bleach_depth,
+        stabilize_frame_start,
+        stabilize_frame_end,
+        stabilize_extrapolation,
+        frame_interval,
+        timing_segments,
+        pixel_size,
+        detect_blur_um,
+        min_pc,
+        min_diameter,
+        save_threshold_masks,
     ) = args_tuple
 
     input_path = Path(input_path_str)
@@ -1795,6 +2269,18 @@ def _process_file_wrapper(args_tuple):
         subpixel_apply=subpixel_apply,
         exclude_bleach_from_stab=exclude_bleach_from_stab,
         pre_bleach_frames=pre_bleach_frames,
+        bleach_spot_min_area=bleach_spot_min_area,
+        min_bleach_depth=min_bleach_depth,
+        stabilize_frame_start=stabilize_frame_start,
+        stabilize_frame_end=stabilize_frame_end,
+        stabilize_extrapolation=stabilize_extrapolation,
+        frame_interval=frame_interval,
+        timing_segments=timing_segments,
+        pixel_size=pixel_size,
+        detect_blur_um=detect_blur_um,
+        min_pc=min_pc,
+        min_diameter=min_diameter,
+        save_threshold_masks=save_threshold_masks,
     )
 
 
@@ -1817,15 +2303,34 @@ def main():
     parser.add_argument("--morph-open-radius", type=int, default=1,
                         help="Radius of disk for morphological opening on pre-bleach mask (0 to disable).")
     parser.add_argument("--smooth-sigma", type=float, default=1.0,
-                        help="Gaussian sigma for smoothing pre-bleach frame before thresholding.")
+                        help="Gaussian sigma (pixels) for smoothing pre-bleach frame before "
+                             "thresholding. Used only when --detect-blur-um / --pixel-size are "
+                             "not both provided.")
+    parser.add_argument("--pixel-size", type=float, default=0.0,
+                        help="Micron/pixel. Enables physically-sized detection blur "
+                             "(--detect-blur-um). Default 0 = fall back to --smooth-sigma (px).")
+    parser.add_argument("--detect-blur-um", type=float, default=1.0,
+                        help="Pre-threshold Gaussian blur in microns applied to the 8-bit "
+                             "pre-bleach detection image (default 1.0 um). Requires --pixel-size "
+                             "> 0; otherwise --smooth-sigma (px) is used.")
     parser.add_argument("--clear-borders", action="store_true",
                         help="Remove droplets touching image borders in the full frame.")
     parser.add_argument("--no-clear-borders", action="store_true",
                         help="Do NOT remove border-touching droplets in the full frame.")
-    parser.add_argument("--ratio-blur-sigma", type=float, default=0.7,
-                        help="Gaussian sigma for smoothing frame0/frame1 ratio image.")
+    parser.add_argument("--ratio-blur-sigma", type=float, default=2.0,
+                        help="Gaussian sigma for smoothing the pre/post ratio image before "
+                             "bleach-spot thresholding (matches the hand-analysis macro's sigma=2).")
     parser.add_argument("--bleach-threshold", type=float, default=1.2,
-                        help="FRAP if mean(frame0/frame1) > bleach_threshold.")
+                        help="Ratio cutoff for BLEACH SPOTS: pixels where pre/post ratio "
+                             "(mean pre-bleach / first post-bleach) exceeds this are bleach "
+                             "spots. A droplet overlapping a spot is FRAP, else NoBleach.")
+    parser.add_argument("--bleach-spot-min-area", type=float, default=5.0,
+                        help="Minimum area (pixels) of a bleach spot; smaller specks are "
+                             "ignored as noise. Set lower for very small bleach ROIs.")
+    parser.add_argument("--min-bleach-depth", type=float, default=0.3,
+                        help="Minimum fractional intensity drop (1 - post/pre) for a spot to "
+                             "count as a real bleach. Default 0.3 (30%%) rejects ordinary "
+                             "acquisition photobleaching; set 0 to disable.")
     parser.add_argument("--crop-multiplier", type=float, default=2.0,
                         help="Square side = crop_multiplier * equivalent_diameter.")
 
@@ -1847,16 +2352,45 @@ def main():
     parser.add_argument("--refine-iterations", type=int, default=20,
                         help="Number of refinement passes at full resolution (1 = single pass, >1 = iterative refinement).")
 
-    parser.add_argument("--min-nobleach-diameter", type=float, default=10.0,
-                        help="Minimum equivalent diameter (pixels) for NoBleach droplets to keep.")
-    parser.add_argument("--min-nobleach-pc", type=float, default=5.0,
-                        help="Minimum partition coefficient (droplet/background) for NoBleach droplets to keep.")
+    parser.add_argument("--min-nobleach-diameter", type=float, default=0.0,
+                        help="Optional quality gate: minimum equivalent diameter (pixels) for "
+                             "NoBleach droplets. Default 0 keeps every droplet; raise it to prune "
+                             "tiny droplets from the photobleach-reference pool.")
+    parser.add_argument("--min-nobleach-pc", type=float, default=0.0,
+                        help="Optional quality gate: minimum partition coefficient (droplet/"
+                             "background) for NoBleach droplets. Default 0 keeps everything.")
+
+    parser.add_argument("--min-pc", type=float, default=0.0,
+                        help="General quality gate: minimum partition coefficient for ALL "
+                             "droplets (FRAP and NoBleach). Default 0 keeps everything.")
+    parser.add_argument("--min-diameter", type=float, default=0.0,
+                        help="General quality gate: minimum equivalent diameter (px) for ALL "
+                             "droplets (FRAP and NoBleach). Default 0 keeps everything.")
+    parser.add_argument("--save-threshold-masks", action="store_true",
+                        help="Save a whole-FOV threshold QC stack (threshold_masks_<movie>.tif: "
+                             "8-bit detection image, droplet mask, bleach-spot mask). Distinct "
+                             "from the per-droplet FRAP_droplet_masks.tif crops.")
 
     parser.add_argument("--n-jobs", type=int, default=8,
                         help="Number of parallel workers for processing multiple files (default: 8).")
 
     parser.add_argument("--no-stabilize", action="store_true",
                         help="Disable image stabilization. By default stabilization is ON.")
+
+    # Frame-range stabilization: estimate drift on frame 0 + [start, end] only, then expand
+    # to a continuous whole-stack trajectory aligned to frame 0 (no tail jump).
+    parser.add_argument("--stabilize-frame-start", type=int, default=0,
+                        help="First frame of the stabilization estimation window (default 0).")
+    parser.add_argument("--stabilize-frame-end", type=int, default=-1,
+                        help="Last frame of the stabilization estimation window (-1 = last frame). "
+                             "Drift is estimated only on frame 0 + [start, end]; frames outside are "
+                             "filled by the chosen extrapolation and the transform is applied to the "
+                             "whole stack.")
+    parser.add_argument("--stabilize-extrapolation", choices=["hold", "linear", "poly"],
+                        default="hold",
+                        help="How to fill shifts outside the estimation window: 'hold' (repeat "
+                             "nearest, jump-free; default), 'linear' (continue end slope), or "
+                             "'poly' (low-order drift model over the range).")
 
     # Subpixel application is now the DEFAULT: it gives smooth, accurate registration so a
     # fixed ROI measures the true droplet/bleach area across all frames. Pass
@@ -1865,6 +2399,13 @@ def main():
     parser.add_argument("--pre-bleach-frames", type=int, default=1,
                         help="Number of leading pre-bleach frames. The bleach event is taken to occur "
                              "between frame N-1 and frame N (default 1: frame 0 pre, frame 1 post).")
+    parser.add_argument("--frame-interval", type=float, default=1.0,
+                        help="Constant frame interval (s) used only when acquisition metadata "
+                             "and --timing-segments are both unavailable.")
+    parser.add_argument("--timing-segments", type=str, default="",
+                        help="Variable acquisition timing, e.g. '300x0.1,35x10' = 300 frames at "
+                             "0.1 s then 35 at 10 s. Used when metadata timestamps are absent; "
+                             "written to the *_frame_times.csv sidecar for the analysis stage.")
     parser.add_argument("--subpixel-stabilization", action="store_true",
                         help="(Default behaviour) Apply drift at subpixel precision with bilinear "
                              "interpolation. Kept for backward compatibility; subpixel is now the default.")
@@ -1903,11 +2444,13 @@ def main():
     no_stabilization_flag = args.no_stabilize  # default: stabilization ON
     use_lucas_kanade = args.stabilize_algorithm in ["lucas-kanade", "lk"]
 
-    clear_borders_flag = True
-    if args.no_clear_borders:
-        clear_borders_flag = False
-    elif args.clear_borders:
+    # Default is now KEEP border-touching droplets (recall over edge-completeness); pass
+    # --clear-borders to drop droplets touching the image edge.
+    clear_borders_flag = False
+    if args.clear_borders:
         clear_borders_flag = True
+    elif args.no_clear_borders:
+        clear_borders_flag = False
 
     # Collect files
     # Supported file extensions
@@ -1977,6 +2520,18 @@ def main():
             (not args.whole_pixel_stabilization),
             args.exclude_bleach_from_stabilization,
             args.pre_bleach_frames,
+            args.bleach_spot_min_area,
+            args.min_bleach_depth,
+            args.stabilize_frame_start,
+            args.stabilize_frame_end,
+            args.stabilize_extrapolation,
+            args.frame_interval,
+            args.timing_segments,
+            args.pixel_size,
+            args.detect_blur_um,
+            args.min_pc,
+            args.min_diameter,
+            args.save_threshold_masks,
         ))
 
     total = 0

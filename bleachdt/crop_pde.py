@@ -45,6 +45,7 @@ from skimage.morphology import (
 )
 from skimage.segmentation import clear_border
 from skimage.transform import resize
+from skimage.measure import label as sk_label
 from scipy.ndimage import binary_fill_holes
 from numba import njit
 
@@ -132,7 +133,101 @@ def make_droplet_mask(pre_frame, min_size=50):
     return mask.astype(bool)
 
 
-def make_bleach_mask(pre_frame, post_frame, droplet_mask, ratio_percentile=90.0):
+def second_channel_usable(pre_frame_ch, droplet_mask, min_size=50,
+                          min_contrast=0.15, min_snr=3.0):
+    """Decide whether a secondary channel carries usable fluorescent signal.
+
+    Used to handle mixed 1-/2-channel datasets and 2-channel movies whose second
+    channel is empty. Returns ``(usable: bool, reason: str)``. A channel is skipped when:
+      - it registers NO signal: the droplets (as defined on the analysis channel) are not
+        meaningfully brighter than the surrounding background, or the frame is ~flat; OR
+      - it FAILS thresholding: Otsu segmentation of the channel yields essentially no
+        foreground (empty) or nearly the whole frame (no real structure).
+    """
+    fr = np.asarray(pre_frame_ch, dtype=np.float64)
+    dmask = np.asarray(droplet_mask, dtype=bool)
+    outside = ~dmask
+
+    # 1) Signal / contrast within the (analysis-channel) droplet ROIs.
+    if dmask.any() and outside.any():
+        in_med = float(np.median(fr[dmask]))
+        out_vals = fr[outside]
+        out_med = float(np.median(out_vals))
+        out_mad = float(np.median(np.abs(out_vals - out_med))) * 1.4826 + 1e-6
+        contrast = (in_med - out_med) / (abs(out_med) + 1e-6)
+        snr = (in_med - out_med) / out_mad
+        if contrast < min_contrast or snr < min_snr:
+            return False, f"no signal (droplet/background contrast={contrast:.2f}, SNR={snr:.1f})"
+    else:
+        # No droplet ROI to test against; fall back to a flatness check.
+        rng = float(np.percentile(fr, 99) - np.median(fr))
+        if rng <= (abs(float(np.median(fr))) * 0.05 + 1e-6):
+            return False, "no signal (channel is essentially flat)"
+
+    # 2) Independent thresholding sanity-check on the channel itself.
+    try:
+        m = make_droplet_mask(fr.astype(np.float32), min_size=min_size)
+        frac = float(m.mean())
+        if frac <= 0.0005 or frac >= 0.95:
+            return False, f"thresholding failed (foreground fraction={frac:.3f})"
+    except Exception as e:
+        return False, f"thresholding error ({e})"
+
+    return True, "usable"
+
+
+def plan_channels(path, analysis_channel_1, droplet_min_size, two_channel, pre_bleach_frames=1):
+    """Decide which channels of a cropped droplet movie to analyze.
+
+    Returns a list of ``(measure_channel_1, channel_suffix, collect_images)`` tuples:
+      - 1-channel movie, or two_channel disabled -> just the analysis channel, no suffix.
+      - multi-channel + two_channel enabled -> the analysis channel (suffixed ``_chN``,
+        collects the diagnostic plots) plus every OTHER channel that passes
+        ``second_channel_usable`` (suffixed, plots skipped). Empty / signal-less / non-
+        thresholdable channels are dropped, so mixed 1-/2-channel datasets and 2-channel
+        movies with a dark second channel are all handled per-file.
+    """
+    try:
+        stack_tc = load_movie_tc(path)
+    except Exception:
+        return [(analysis_channel_1, "", True)]
+    T, nch = stack_tc.shape[0], stack_tc.shape[1]
+    ac = int(np.clip(analysis_channel_1, 1, max(1, nch))) - 1
+    if nch <= 1 or not two_channel:
+        return [(analysis_channel_1, "", True)]
+
+    fp_idx = min(max(1, int(pre_bleach_frames)), max(1, T - 1)) - 1
+    try:
+        droplet_mask = make_droplet_mask(stack_tc[fp_idx, ac], min_size=droplet_min_size)
+    except Exception:
+        return [(analysis_channel_1, "", True)]
+
+    plan = [(ac + 1, f"_ch{ac + 1}", True)]
+    for ch in range(nch):
+        if ch == ac:
+            continue
+        usable, reason = second_channel_usable(
+            stack_tc[fp_idx, ch], droplet_mask, min_size=droplet_min_size
+        )
+        if usable:
+            plan.append((ch + 1, f"_ch{ch + 1}", False))
+        else:
+            logger.info(f"{os.path.basename(path)}: skipping channel {ch + 1} ({reason}).")
+    return plan
+
+
+def make_bleach_mask(pre_frame, post_frame, droplet_mask,
+                     ratio_percentile=90.0, bleach_depth=0.0):
+    """Build the bleach ROI used to MEASURE recovery.
+
+    Preferred (bleach_depth > 0): threshold the pre/post ratio by a physical *bleach
+    depth* (depth d <-> ratio >= 1/(1-d)), keep the contiguous bleached region, and
+    measure ALL of its pixels. This matches the classification step (one "bleach depth"
+    knob) and reports the whole contiguous bleach spot rather than an intensity-percentile
+    subset.
+
+    Fallback (bleach_depth <= 0): legacy percentile threshold on the in-droplet ratio.
+    """
     logger.info("Generating bleach mask from pre/post ratio...")
     eps = 1e-6
     ratio = pre_frame / (post_frame + eps)
@@ -144,15 +239,28 @@ def make_bleach_mask(pre_frame, post_frame, droplet_mask, ratio_percentile=90.0)
         logger.warning("No droplet pixels when building bleach mask.")
         return np.zeros_like(droplet_mask, dtype=bool)
 
-    thr = np.percentile(vals, ratio_percentile)
-    mask = ratio >= thr
-    mask = binary_opening(mask, disk(1))
-    mask = binary_dilation(mask, disk(1))
-    mask &= droplet_mask
+    if bleach_depth and 0.0 < float(bleach_depth) < 1.0:
+        thr = 1.0 / (1.0 - float(bleach_depth))
+        mask = ratio >= thr
+        mask = binary_opening(mask, disk(1))
+        mask &= droplet_mask
+        # Keep the single largest contiguous bleach region (the bleach spot), then
+        # measure every pixel inside it. Avoids scattered specks contaminating the ROI.
+        lbl = sk_label(mask)
+        if lbl.max() > 1:
+            sizes = np.bincount(lbl.ravel())
+            sizes[0] = 0
+            mask = (lbl == int(sizes.argmax()))
+        mode = f"depth={bleach_depth:.2f} (ratio>={thr:.3f})"
+    else:
+        thr = np.percentile(vals, ratio_percentile)
+        mask = ratio >= thr
+        mask = binary_opening(mask, disk(1))
+        mask = binary_dilation(mask, disk(1))
+        mask &= droplet_mask
+        mode = f"percentile={ratio_percentile}, thr={thr:.3f}"
 
-    logger.debug(
-        f"Bleach mask: {int(mask.sum())} pixels, percentile={ratio_percentile}, thr={thr:.3f}"
-    )
+    logger.debug(f"Bleach mask: {int(mask.sum())} pixels, {mode}")
     return mask.astype(bool)
 
 
@@ -767,7 +875,15 @@ def recovery_metrics(YM, Y0, k, pre_level=1.0):
     recovery_amplitude = YM - Y0
     denom = pre_level - Y0
     mobile = recovery_amplitude / denom if denom != 0 else float("nan")
-    immobile = 1.0 - mobile if np.isfinite(mobile) else float("nan")
+    # Mobile and immobile fractions are physical fractions in [0, 1]. Clamp so a noisy or
+    # slightly-overshooting fit can't report e.g. 1.6 or a negative fraction; the bounded
+    # fit (fit_single_exp_plateau) keeps them close to this range, and this guarantees it.
+    if np.isfinite(mobile):
+        mobile = float(min(1.0, max(0.0, mobile)))
+        immobile = 1.0 - mobile
+    else:
+        mobile = float("nan")
+        immobile = float("nan")
     t_half = (np.log(2.0) / k) if (np.isfinite(k) and k > 0) else float("nan")
     return {
         "recovery_amplitude": float(recovery_amplitude),
@@ -800,16 +916,25 @@ def fit_single_exp_plateau(times, intensities, constrain_Y0=None):
             return {"success": False}
         
         Y0_fixed = float(constrain_Y0)
-        YM0 = float(np.nanmax(y))
-        k0 = 0.01
-        
+
         def constrained_exp(t, YM, k):
             return YM - (YM - Y0_fixed) * np.exp(-k * t)
-        
-        p0 = [YM0, k0]
-        
+
+        # Bound the plateau to (roughly) the observable recovery so an ill-conditioned /
+        # non-recovering curve can't extrapolate YM to absurd values. YM in
+        # [min(Y0, data), observed_max + small]; k >= 0 (recovery or flat, never "decay").
+        y_lo = float(np.nanmin(y)); y_hi = float(np.nanmax(y))
+        # Tiny headroom only (relative to the data range) so YM stays at the OBSERVED
+        # plateau -- a flat curve then yields mobile ~= 0 instead of fitting noise as slow
+        # recovery.
+        eps_hi = max(1e-3, 0.01 * (y_hi - y_lo))
+        ym_lo = min(Y0_fixed, y_lo)
+        ym_hi = max(y_hi, Y0_fixed) + eps_hi
+        YM0 = float(np.clip(y_hi, ym_lo, ym_hi))
+        p0 = [YM0, 0.01]
         try:
-            popt, _ = curve_fit(constrained_exp, t, y, p0=p0, maxfev=20000)
+            popt, _ = curve_fit(constrained_exp, t, y, p0=p0, maxfev=20000,
+                                bounds=([ym_lo, 0.0], [ym_hi, np.inf]))
             YM, k = popt
             Y0 = Y0_fixed
             y_pred = constrained_exp(t, YM, k)
@@ -832,13 +957,21 @@ def fit_single_exp_plateau(times, intensities, constrain_Y0=None):
         if t.size < 3:
             return {"success": False}
 
-        YM0 = float(np.nanmax(y))
+        y_lo = float(np.nanmin(y)); y_hi = float(np.nanmax(y))
+        YM0 = y_hi
         Y0_0 = float(y[0])
         k0 = 0.01
-        p0 = [YM0, Y0_0, k0]
+        # Bounds: YM to the observable plateau, Y0 within the data, k >= 0.
+        ym_lo = y_lo - 0.05
+        ym_hi = y_hi + 0.05
+        y0_lo = y_lo - 0.1
+        y0_hi = y_hi + 0.1
+        p0 = [float(np.clip(YM0, ym_lo, ym_hi)),
+              float(np.clip(Y0_0, y0_lo, y0_hi)), k0]
 
         try:
-            popt, _ = curve_fit(single_exp_plateau, t, y, p0=p0, maxfev=20000)
+            popt, _ = curve_fit(single_exp_plateau, t, y, p0=p0, maxfev=20000,
+                                bounds=([ym_lo, y0_lo, 0.0], [ym_hi, y0_hi, np.inf]))
             YM, Y0, k = popt
             y_pred = single_exp_plateau(t, *popt)
         except Exception as e:
@@ -2077,6 +2210,11 @@ def process_movie(
     output_all_channels: bool = False,
     normalization_method: str = "both",
     pre_bleach_frames: int = 1,
+    measure_channel_1: int = None,
+    channel_suffix: str = "",
+    frame_times=None,
+    pde_enabled: bool = True,
+    bleach_depth: float = 0.0,
 ):
     # normalization_method selects which RawIntDen-based normalized recovery curve is
     # reported as the headline FRAP curve ("prebleach", "wholedroplet", or "both").
@@ -2132,14 +2270,12 @@ def process_movie(
         "droplet_radius_um": np.nan,
     }
 
-    by_channel_sep = {}
-    by_channel_comb = {}
     try:
         stack_tc = load_movie_tc(path)
         T, nch, H, W = stack_tc.shape
         if T < 2:
             logger.error("Movie has fewer than 2 frames; cannot perform FRAP.")
-            return {"analysis_channel": 1, "by_channel_sep": {1: summary_sep}, "by_channel_comb": {}}
+            return summary_sep, None
 
         ac = int(np.clip(analysis_channel_1, 1, nch)) - 1
         if nch > 1:
@@ -2153,7 +2289,8 @@ def process_movie(
         post_a = stack_tc[first_post, ac]
         droplet_mask_full = make_droplet_mask(pre_a, min_size=droplet_min_size)
         bleach_mask_full = make_bleach_mask(
-            pre_a, post_a, droplet_mask_full, ratio_percentile
+            pre_a, post_a, droplet_mask_full, ratio_percentile,
+            bleach_depth=bleach_depth,
         )
         mask_post_analysis = stack_tc[1, ac]
 
@@ -2167,57 +2304,55 @@ def process_movie(
         droplet_area_um2 = droplet_area_px * (pixel_size ** 2)
         droplet_radius_um = np.sqrt(droplet_area_um2 / (np.pi + 1e-12))
 
-        channels_run = (
-            list(range(nch)) if (output_all_channels and nch > 1) else [ac]
-        )
+        # This call analyzes a SINGLE channel. Masks/ROIs come from the analysis channel
+        # (ac); intensities are measured from `measure_ch` (defaults to ac). Two-channel
+        # datasets are handled by the caller, which validates the other channel(s) and
+        # calls process_movie once per usable channel with a distinguishing channel_suffix.
+        measure_ch = (int(np.clip(measure_channel_1, 1, nch)) - 1) if measure_channel_1 else ac
+        stack = stack_tc[:, measure_ch, :, :]
+        suff = channel_suffix or ""
 
-        for ch in channels_run:
-            stack = stack_tc[:, ch, :, :]
-            suff = f"_ch{ch + 1}" if (nch > 1 and output_all_channels) else ""
-            collect_im = ch == ac
-            ic_use = image_collector if collect_im else None
-
-            summary_sep = {
-                "filename": basename,
-                "channel": ch + 1,
-                "D_um2_per_s": np.nan,
-                "success": False,
-                "cost": np.nan,
-                "n_frames_fit": 0,
-                "frame_interval_s": frame_interval,
-                "pixel_size_um": pixel_size,
-                "background": np.nan,
-                "pre_mean": np.nan,
-                "k_single_exp": np.nan,
-                "mobile_fraction": np.nan,
-                "immobile_fraction": np.nan,
-                "YM_single_exp": np.nan,
-                "Y0_single_exp": np.nan,
-                "K_pre": np.nan,
-                "bleach_fraction": bleach_fraction,
-                "droplet_radius_um": droplet_radius_um,
-            }
-            summary_comb = {
-                "filename": basename,
-                "channel": ch + 1,
-                "D_um2_per_s": np.nan,
-                "success": False,
-                "cost": np.nan,
-                "n_frames_fit": 0,
-                "frame_interval_s": frame_interval,
-                "pixel_size_um": pixel_size,
-                "background": np.nan,
-                "pre_mean": np.nan,
-                "k_single_exp": np.nan,
-                "mobile_fraction": np.nan,
-                "immobile_fraction": np.nan,
-                "YM_single_exp": np.nan,
-                "Y0_single_exp": np.nan,
-                "K_pre": np.nan,
-                "bleach_fraction": bleach_fraction,
-                "T_switch_frame": -1,
-                "droplet_radius_um": droplet_radius_um,
-            }
+        summary_sep = {
+            "filename": basename + suff,
+            "channel": measure_ch + 1,
+            "D_um2_per_s": np.nan,
+            "success": False,
+            "cost": np.nan,
+            "n_frames_fit": 0,
+            "frame_interval_s": frame_interval,
+            "pixel_size_um": pixel_size,
+            "background": np.nan,
+            "pre_mean": np.nan,
+            "k_single_exp": np.nan,
+            "mobile_fraction": np.nan,
+            "immobile_fraction": np.nan,
+            "YM_single_exp": np.nan,
+            "Y0_single_exp": np.nan,
+            "K_pre": np.nan,
+            "bleach_fraction": bleach_fraction,
+            "droplet_radius_um": droplet_radius_um,
+        }
+        summary_comb = {
+            "filename": basename + suff,
+            "channel": measure_ch + 1,
+            "D_um2_per_s": np.nan,
+            "success": False,
+            "cost": np.nan,
+            "n_frames_fit": 0,
+            "frame_interval_s": frame_interval,
+            "pixel_size_um": pixel_size,
+            "background": np.nan,
+            "pre_mean": np.nan,
+            "k_single_exp": np.nan,
+            "mobile_fraction": np.nan,
+            "immobile_fraction": np.nan,
+            "YM_single_exp": np.nan,
+            "Y0_single_exp": np.nan,
+            "K_pre": np.nan,
+            "bleach_fraction": bleach_fraction,
+            "T_switch_frame": -1,
+            "droplet_radius_um": droplet_radius_um,
+        }
 
         norm_full, bg, pre_mean = normalize_stack(stack, droplet_mask_full,
                                                   pre_bleach_frames=first_post)
@@ -2362,8 +2497,15 @@ def process_movie(
         #   - background-subtracted integrated density for each,
         #   - BOTH normalized recovery curves (pre-bleach-frame and whole-droplet-ratio).
         # This guarantees raw intensities are never lost and both normalizations are available.
-        times_full = np.arange(T, dtype=np.float32) * frame_interval
-        ts_csv = os.path.join(summary_dir, f"{basename}_frap_timeseries.csv")
+        # Real per-frame time axis: use the resolved frame_times (variable acquisition
+        # cadence) when provided, else the uniform frame_interval grid. First frame = 0.
+        if frame_times is not None and len(frame_times) >= T:
+            frame_times_arr = np.asarray(frame_times[:T], dtype=np.float64)
+            frame_times_arr = (frame_times_arr - frame_times_arr[0])
+        else:
+            frame_times_arr = np.arange(T, dtype=np.float64) * float(frame_interval)
+        times_full = frame_times_arr.astype(np.float32)
+        ts_csv = os.path.join(summary_dir, f"{basename}{suff}_frap_timeseries.csv")
 
         def _g(arr, i):
             return arr[i] if i < len(arr) else float("nan")
@@ -2390,9 +2532,12 @@ def process_movie(
                 )
 
 
+        # max_frames <= 0 (e.g. the -1 default) means "use the whole movie" (last frame).
+        mf = (T - 1) if (max_frames is None or max_frames <= 0) else int(max_frames)
+
         # ---------- PDE WINDOW ----------
         pde_first = max(1, pde_first_frame)
-        pde_last_eff = min(T - 1, max_frames, pde_last_frame)
+        pde_last_eff = min(T - 1, mf, pde_last_frame)
         if pde_last_eff < pde_first:
             logger.error("Invalid PDE frame window; skipping movie.")
             return summary_sep, None
@@ -2413,11 +2558,12 @@ def process_movie(
         weights_pde = weights_pde / (np.nanmax(weights_pde) + eps)
         weights_pde = np.maximum(weights_pde, 0.05).astype(np.float32)
 
-        logger.info(
-            f"PDE fit frames {pde_first}-{pde_last_eff} "
-            f"({len(frame_ids_pde)} post-bleach frames); "
-            f"weight range=({weights_pde.min():.3g},{weights_pde.max():.3g})"
-        )
+        if pde_enabled:
+            logger.info(
+                f"PDE fit frames {pde_first}-{pde_last_eff} "
+                f"({len(frame_ids_pde)} post-bleach frames); "
+                f"weight range=({weights_pde.min():.3g},{weights_pde.max():.3g})"
+            )
 
         data_stack = np.ascontiguousarray(
             norm_crop_ds[frame_ids_pde].astype(np.float32)
@@ -2425,17 +2571,20 @@ def process_movie(
         domain_mask = np.ascontiguousarray(droplet_ds.astype(bool))
         fit_mask_bool = np.ascontiguousarray(fit_mask.astype(bool))
 
-        # PDE times for fitting: relative to first PDE frame (t_rel=0 there)
+        # PDE times for fitting: real seconds relative to the first PDE frame (t_rel=0
+        # there). Using the true time axis makes D correct under a variable cadence, and
+        # lets a dense early burst supply many closely-spaced points to the diffusion fit.
         times_pde_rel = np.ascontiguousarray(
-            (frame_ids_pde - frame_ids_pde[0]).astype(np.float32) * frame_interval
+            (frame_times_arr[frame_ids_pde] - frame_times_arr[frame_ids_pde[0]]).astype(np.float32)
         )
 
         dx = float(pixel_size_eff)
         dt_stable = 0.24 * dx * dx / max(D_max, 1e-6)
         dt_sim = dt_stable
-        logger.info(
-            f"Using dt_sim={dt_sim:.4g}s for PDE (stable for D_max={D_max}, dx={dx})"
-        )
+        if pde_enabled:
+            logger.info(
+                f"Using dt_sim={dt_sim:.4g}s for PDE (stable for D_max={D_max}, dx={dx})"
+            )
 
         # Initial condition: first post-bleach frame, masked
         c0 = np.ascontiguousarray(
@@ -2443,43 +2592,59 @@ def process_movie(
         )
         weights_pde = np.ascontiguousarray(weights_pde)
 
-        # Fit D via grid search
-        D_best, cost_best = grid_search_D(
-            D_min,
-            D_max,
-            D_grid_size,
-            D_refine_grid_size,
-            c0,
-            data_stack,
-            domain_mask,
-            fit_mask_bool,
-            times_pde_rel,
-            weights_pde,
-            dt_sim,
-            dx,
-            n_jobs_D=n_jobs_D,
-        )
+        # Fit D via grid search -- ONLY when PDE fitting is enabled. When it is off, the
+        # (expensive) two-stage diffusion grid search is skipped entirely and D is left
+        # undefined; the single exponential below becomes the only model for the movie.
+        if pde_enabled:
+            D_best, cost_best = grid_search_D(
+                D_min,
+                D_max,
+                D_grid_size,
+                D_refine_grid_size,
+                c0,
+                data_stack,
+                domain_mask,
+                fit_mask_bool,
+                times_pde_rel,
+                weights_pde,
+                dt_sim,
+                dx,
+                n_jobs_D=n_jobs_D,
+            )
+            n_frames_fit = int(len(frame_ids_pde))
+        else:
+            D_best, cost_best = float("nan"), float("nan")
+            n_frames_fit = 0
+            logger.info(
+                "PDE fitting disabled: skipping D grid search "
+                "(single-exponential fit only)."
+            )
 
         summary_sep["D_um2_per_s"] = D_best
         summary_sep["success"] = True
         summary_sep["cost"] = cost_best
-        summary_sep["n_frames_fit"] = int(len(frame_ids_pde))
+        summary_sep["n_frames_fit"] = n_frames_fit
 
         summary_comb["D_um2_per_s"] = D_best
         summary_comb["success"] = True
         summary_comb["cost"] = cost_best
-        summary_comb["n_frames_fit"] = int(len(frame_ids_pde))
+        summary_comb["n_frames_fit"] = n_frames_fit
 
         # ---------- EXPONENTIAL WINDOW (SEPARATE MODEL) ----------
         exp_fit = None
         if exp_plateau_fit:
-            # Use all post-bleach frames (excluding the pre-bleach frames)
+            # Single exponential over the WHOLE post-bleach movie: first post-bleach frame
+            # to the end (or the max_frames cap when the user sets one; -1 => last frame).
+            # This window is independent of the PDE window, so with PDE disabled this is the
+            # sole model and spans first_post..end as intended.
             exp_first = first_post  # First post-bleach frame
-            exp_last_eff = min(T - 1, max_frames)  # Up to max_frames or end of movie
+            exp_last_eff = min(T - 1, mf)  # Up to max_frames cap or end of movie
             if exp_last_eff >= exp_first:
                 frame_ids_exp = np.arange(exp_first, exp_last_eff + 1, dtype=int)
-                # Time axis: frame 1 is at t=0, frame 2 is at frame_interval, etc.
-                t_exp = (frame_ids_exp - exp_first).astype(np.float32) * frame_interval
+                # Real-time axis relative to the first post-bleach frame (variable cadence
+                # aware): the sparse tail lands at its true seconds, so the plateau fit and
+                # half-time are correct even when early frames are 100 ms and later 10 s apart.
+                t_exp = (frame_times_arr[frame_ids_exp] - frame_times_arr[exp_first]).astype(np.float32)
                 y_exp = frap_curve[frame_ids_exp]
                 # Constrain Y0 to the first post-bleach frame (frame 1)
                 Y0_constraint = float(frap_curve[exp_first])
@@ -2524,7 +2689,7 @@ def process_movie(
         frame_ids_exp_for_plot = None
         if exp_fit is not None and exp_fit.get("success", False):
             exp_first = first_post
-            exp_last_eff = min(T - 1, max_frames)
+            exp_last_eff = min(T - 1, mf)
             if exp_last_eff >= exp_first:
                 frame_ids_exp_for_plot = np.arange(exp_first, exp_last_eff + 1, dtype=int)
         
@@ -2563,11 +2728,19 @@ def process_movie(
 
         # Note: Per-movie CSV summaries are now written to a combined file at the end
 
-        # ---------- COMBINED MODEL (PDE + CONSTRAINED EXPONENTIAL) ----------
+        # ---------- COMBINED (MIXED) MODEL (PDE + CONSTRAINED EXPONENTIAL) ----------
+        # The mixed model requires a valid PDE fit, so it only runs when PDE fitting is
+        # enabled AND the mixed model was explicitly selected (combined_model).
         combined_curve_best = None
         T_switch_best = None
-        if combined_model and exp_plateau_fit and summary_sep["success"]:
-            exp_last_eff = min(T - 1, max_frames, exp_last_frame)
+        if (
+            pde_enabled
+            and combined_model
+            and exp_plateau_fit
+            and summary_sep["success"]
+            and np.isfinite(D_best)
+        ):
+            exp_last_eff = min(T - 1, mf, exp_last_frame)
             if exp_last_eff > pde_first:
                 # PDE mean curve over full PDE window (for all candidates)
                 times_pde_all, pde_curve_all = compute_pde_mean_curve(
@@ -2687,25 +2860,84 @@ def process_movie(
     except Exception as e:
         logger.error(f"Error processing movie {basename}: {e}", exc_info=True)
 
-    return summary_sep, (summary_comb if combined_model else None)
+    return summary_sep, (summary_comb if (pde_enabled and combined_model) else None)
 
 
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
 
-def write_normalization_stacked_csvs(timeseries_files, out_dir, normalization_method):
-    """Build wide 'stacked' CSVs (frames x droplets) of ALL FRAP curves (unfiltered),
-    one per normalization method, from a list of ``*_frap_timeseries.csv`` files.
+def _movie_of(curve_name):
+    """Extract the movie name from a bleach-point / droplet name like
+    ``Drift_<movie>_FRAP_droplet003`` (optionally ``_chN``). Falls back to the full name."""
+    s = str(curve_name)
+    if s.startswith("Drift_"):
+        s = s[len("Drift_"):]
+    for marker in ("_FRAP_droplet", "_NoBleach_droplet"):
+        i = s.find(marker)
+        if i >= 0:
+            return s[:i]
+    return s
 
-    Produces:
+
+def load_frame_times(results_dir, T, frame_interval):
+    """Load the per-frame time axis (seconds) from a ``*_frame_times.csv`` sidecar written
+    by the crop stage (variable acquisition cadence). Falls back to uniform
+    ``arange(T) * frame_interval`` when no sidecar is present, so uniform-timing movies are
+    unaffected. Always returns a length-T float array whose first element is 0."""
+    try:
+        cands = glob.glob(os.path.join(results_dir, "*_frame_times.csv")) if results_dir else []
+        if cands:
+            import pandas as pd
+            df = pd.read_csv(cands[0])
+            if "time_s" in df.columns:
+                tv = np.asarray(df["time_s"].to_numpy(), dtype=float)
+                if len(tv) >= T:
+                    tv = tv[:T]
+                elif len(tv) >= 2:
+                    dt = tv[-1] - tv[-2]
+                    tv = np.concatenate([tv, tv[-1] + np.arange(1, T - len(tv) + 1) * dt])
+                else:
+                    raise ValueError("sidecar too short")
+                return (tv - tv[0]).astype(np.float64)
+    except Exception:
+        pass
+    return np.arange(T, dtype=np.float64) * float(frame_interval)
+
+
+def write_normalization_stacked_csvs(timeseries_files, out_dir, normalization_method,
+                                     keep_names=None, name_suffix=""):
+    """Build wide 'stacked' CSVs (frames x droplets) of FRAP curves, one per
+    normalization method, from a list of ``*_frap_timeseries.csv`` files.
+
+    Produces (``name_suffix`` inserted before ``.csv``):
       - ``Pre-bleach_stacked_all.csv``    (column ``FRAP_norm_prebleach``)
       - ``Whole-droplet_stacked_all.csv`` (column ``FRAP_norm_wholedroplet``)
+      - the matching ``*_averaged_all.csv`` (one averaged column per movie)
+
+    If ``keep_names`` is given (a set of movie/bleach-point names), only curves whose
+    source movie is in that set are included -- this is how the FILTERED stacked/averaged
+    CSVs are produced. Pass ``keep_names=None`` for the unfiltered raw variant (all
+    droplets), typically with ``name_suffix='_unfiltered'``.
 
     Only the method(s) selected by ``normalization_method`` ('prebleach',
     'wholedroplet', or 'both') are written. Returns the list of written paths.
     """
     import pandas as pd
+
+    def _with_suffix(fname):
+        if name_suffix:
+            base, ext = os.path.splitext(fname)
+            return f"{base}{name_suffix}{ext}"
+        return fname
+
+    keep_set = set(keep_names) if keep_names is not None else None
+
+    def _kept(name):
+        """A curve is kept when its own name or its source movie is in keep_set."""
+        if keep_set is None:
+            return True
+        return name in keep_set or _movie_of(name) in keep_set
 
     method_map = {
         "prebleach": ("FRAP_norm_prebleach", "Pre-bleach_stacked_all.csv"),
@@ -2736,11 +2968,15 @@ def write_normalization_stacked_csvs(timeseries_files, out_dir, normalization_me
             if "droplet" in df.columns:
                 # Consolidated long-format file: one group per bleach point.
                 for dname, g in df.groupby("droplet"):
+                    if not _kept(str(dname)):
+                        continue
                     series_by_name[str(dname)] = g[col].to_numpy()
                     if time_axis is None and "time_s" in g.columns:
                         time_axis = g["time_s"].to_numpy()
             else:
                 name = os.path.basename(f).replace("_frap_timeseries.csv", "")
+                if not _kept(name):
+                    continue
                 series_by_name[name] = df[col].to_numpy()
                 if time_axis is None and "time_s" in df.columns:
                     time_axis = df["time_s"].to_numpy()
@@ -2758,73 +2994,102 @@ def write_normalization_stacked_csvs(timeseries_files, out_dir, normalization_me
             mat[r] = vals
             rows.append([name] + list(vals))
         stacked = pd.DataFrame(rows, columns=["bleach_point"] + frame_cols)
-        out_path = os.path.join(out_dir, fname)
+        out_path = os.path.join(out_dir, _with_suffix(fname))
         try:
             stacked.to_csv(out_path, index=False)
-            logger.info(f"Wrote {fname} ({len(names_sorted)} bleach points x {min_len} frames) to {out_dir}")
+            logger.info(f"Wrote {_with_suffix(fname)} ({len(names_sorted)} bleach points x {min_len} frames) to {out_dir}")
             written.append(out_path)
         except OSError as e:
             logger.warning(f"Could not write {out_path}: {e}")
 
-        # ----- Averaged curve across bleach points (mean +/- SEM per frame) -------------
-        with np.errstate(invalid="ignore"):
-            mean = np.nanmean(mat, axis=0)
-            n = np.sum(np.isfinite(mat), axis=0)
-            sd = np.nanstd(mat, axis=0)
-            sem = np.where(n > 0, sd / np.sqrt(np.maximum(n, 1)), np.nan)
+        # ----- Averaged curve PER MOVIE (one mean recovery curve per movie) -------------
+        # Group the bleach points by their source movie and average within each movie, so
+        # *_averaged_all.csv has one column per movie (not a single grand mean).
+        movie_rows = {}
+        for r, name in enumerate(names_sorted):
+            movie_rows.setdefault(_movie_of(name), []).append(r)
         avg = {"frame_index": np.arange(min_len, dtype=int)}
         if time_axis is not None:
             avg["time_s"] = np.asarray(time_axis)[:min_len]
-        avg["mean"] = mean
-        avg["sem"] = sem
-        avg["n_curves"] = n
-        avg_path = os.path.join(out_dir, avg_map[method])
+        with np.errstate(invalid="ignore"):
+            for mv in sorted(movie_rows):
+                idx = movie_rows[mv]
+                avg[mv] = np.nanmean(mat[idx], axis=0)
+        avg_path = os.path.join(out_dir, _with_suffix(avg_map[method]))
         try:
             pd.DataFrame(avg).to_csv(avg_path, index=False)
+            logger.info(f"Wrote {_with_suffix(avg_map[method])} ({len(movie_rows)} movie average(s)) to {out_dir}")
             written.append(avg_path)
         except OSError as e:
             logger.warning(f"Could not write {avg_path}: {e}")
     return written
 
 
-def consolidate_timeseries_files(summary_dir, results_dir):
+def consolidate_timeseries_files(summary_dir, results_dir, keep_names=None,
+                                 name_suffix=""):
     """Consolidate per-droplet timeseries CSVs (one file per droplet, written to the
     temporary ``summary`` folder) into two long CSVs in the movie folder:
     ``FRAP_droplet_timeseries.csv`` and ``NoBleach_droplet_timeseries.csv``. Each row
     carries a ``droplet`` column identifying its bleach point / control droplet.
+
+    If ``keep_names`` is given, only FRAP droplets whose movie name is in that set are
+    written (this produces the FILTERED ``FRAP_droplet_timeseries.csv``). NoBleach
+    control droplets are never quality-filtered. ``name_suffix`` is inserted before the
+    ``.csv`` of the output file names (used for the ``_unfiltered`` raw variant).
     """
     import pandas as pd
 
-    def _merge(pattern, out_name, suffix):
+    keep_set = set(keep_names) if keep_names is not None else None
+
+    def _out(out_name):
+        if name_suffix:
+            base, ext = os.path.splitext(out_name)
+            return f"{base}{name_suffix}{ext}"
+        return out_name
+
+    def _merge(pattern, out_name, suffix, apply_filter):
         files = sorted(glob.glob(os.path.join(summary_dir, pattern)))
         parts = []
         for f in files:
+            name = os.path.basename(f).replace(suffix, "")
+            if apply_filter and keep_set is not None and (
+                    name not in keep_set and _movie_of(name) not in keep_set):
+                continue
             try:
                 df = pd.read_csv(f)
             except Exception:
                 continue
-            df.insert(0, "droplet", os.path.basename(f).replace(suffix, ""))
+            df.insert(0, "droplet", name)
             parts.append(df)
         if parts:
+            out = _out(out_name)
             try:
                 pd.concat(parts, ignore_index=True, sort=False).to_csv(
-                    os.path.join(results_dir, out_name), index=False
+                    os.path.join(results_dir, out), index=False
                 )
-                logger.info(f"Wrote {out_name} ({len(parts)} droplets) to {results_dir}")
+                logger.info(f"Wrote {out} ({len(parts)} droplets) to {results_dir}")
             except OSError as e:
-                logger.warning(f"Could not write {out_name}: {e}")
+                logger.warning(f"Could not write {out}: {e}")
 
-    _merge("*_frap_timeseries.csv", "FRAP_droplet_timeseries.csv", "_frap_timeseries.csv")
-    _merge("*_control_metrics.csv", "NoBleach_droplet_timeseries.csv", "_control_metrics.csv")
+    _merge("*_frap_timeseries.csv", "FRAP_droplet_timeseries.csv",
+           "_frap_timeseries.csv", apply_filter=True)
+    _merge("*_control_metrics.csv", "NoBleach_droplet_timeseries.csv",
+           "_control_metrics.csv", apply_filter=False)
 
 
-def consolidate_droplet_metrics(results_dir):
+def consolidate_droplet_metrics(results_dir, summary_name="FRAP_condition_summary.csv",
+                                out_name="droplet_metrics.csv", remove_locations=True):
     """Merge a movie's per-droplet metrics into a single ``droplet_metrics.csv``.
 
     Consolidates (best-effort; tolerates missing inputs):
-      - FRAP per-droplet metrics  (Separate rows of FRAP_condition_summary.csv)
+      - FRAP per-droplet metrics  (Separate rows of ``summary_name``)
       - NoBleach per-droplet metrics (NoBleach_summary.csv)
       - droplet location + geometry, incl. X/Y centroid (droplet_locations.csv)
+
+    ``summary_name`` selects which condition-summary CSV to fold in -- the filtered
+    ``FRAP_condition_summary.csv`` (default, -> ``droplet_metrics.csv``) or the raw
+    ``FRAP_condition_summary_unfiltered.csv`` (-> ``droplet_metrics_all.csv``). Set
+    ``remove_locations=False`` to keep ``droplet_locations.csv`` for a subsequent call.
 
     Replaces the previous scatter_plot_raw_data.csv / NoBleach_summary.txt scatter of
     near-duplicate tables with one droplet-keyed metrics file. Returns the output path,
@@ -2836,7 +3101,7 @@ def consolidate_droplet_metrics(results_dir):
         return os.path.splitext(os.path.basename(str(s)))[0]
 
     frames = []
-    frap_path = os.path.join(results_dir, "FRAP_condition_summary.csv")
+    frap_path = os.path.join(results_dir, summary_name)
     if os.path.isfile(frap_path):
         try:
             df = pd.read_csv(frap_path)
@@ -2908,12 +3173,13 @@ def consolidate_droplet_metrics(results_dir):
     rest = [c for c in merged.columns if c not in front]
     merged = merged[front + rest]
 
-    out_path = os.path.join(results_dir, "droplet_metrics.csv")
+    out_path = os.path.join(results_dir, out_name)
     try:
         merged.to_csv(out_path, index=False)
         logger.info(f"Wrote consolidated droplet metrics: {out_path} ({len(merged)} droplet rows)")
-        # droplet_locations.csv is now fully folded into droplet_metrics.csv -> remove it.
-        if os.path.isfile(loc_path):
+        # droplet_locations.csv is now fully folded into droplet_metrics.csv -> remove it
+        # (only on the final call, so a preceding unfiltered pass can still read it).
+        if remove_locations and os.path.isfile(loc_path):
             try:
                 os.remove(loc_path)
             except OSError:
@@ -2922,6 +3188,144 @@ def consolidate_droplet_metrics(results_dir):
         logger.warning(f"consolidate_droplet_metrics: could not write {out_path}: {e}")
         return None
     return out_path
+
+
+def _write_condition_summary_csv(out_path, summaries_sep, summaries_comb, combined_model):
+    """Write a FRAP condition-summary CSV (Combined/Separate rows) from the given
+    per-movie summary dicts. Used for both the filtered ``FRAP_condition_summary.csv``
+    and the raw ``FRAP_condition_summary_unfiltered.csv``."""
+    if not (summaries_sep or (combined_model and summaries_comb)):
+        return
+    with open(out_path, "w") as f:
+        f.write("Models,filename,D_um2_per_s,success,cost,n_frames_fit,"
+                "frame_interval_s,pixel_size_um,background,pre_mean,"
+                "k_single_exp,mobile_fraction,immobile_fraction,"
+                "YM_single_exp,Y0_single_exp,K_pre,bleach_fraction,T_switch_frame,droplet_radius_um,"
+                "recovery_amplitude,half_time_s,mobile_fraction_basis\n")
+        summaries_by_name = {}
+        for s in summaries_sep:
+            summaries_by_name[s.get("filename", "")] = {"separate": s}
+        if combined_model and summaries_comb:
+            for s in summaries_comb:
+                name = s.get("filename", "")
+                summaries_by_name.setdefault(name, {})["combined"] = s
+        for name in sorted(summaries_by_name.keys()):
+            entry = summaries_by_name[name]
+            if "combined" in entry:
+                s = entry["combined"]
+                f.write(f"Combined,{s.get('filename', '')},{s.get('D_um2_per_s', np.nan):.6g},"
+                        f"{int(s.get('success', False))},{s.get('cost', np.nan):.6g},"
+                        f"{s.get('n_frames_fit', 0)},{s.get('frame_interval_s', np.nan):.6g},"
+                        f"{s.get('pixel_size_um', np.nan):.6g},{s.get('background', np.nan):.6g},"
+                        f"{s.get('pre_mean', np.nan):.6g},"
+                        f"{s.get('k_single_exp', np.nan):.6g},"
+                        f"{s.get('mobile_fraction', np.nan):.6g},"
+                        f"{s.get('immobile_fraction', np.nan):.6g},"
+                        f"{s.get('YM_single_exp', np.nan):.6g},"
+                        f"{s.get('Y0_single_exp', np.nan):.6g},"
+                        f"{s.get('K_pre', np.nan):.6g},"
+                        f"{s.get('bleach_fraction', np.nan):.6g},"
+                        f"{s.get('T_switch_frame', -1)},"
+                        f"{s.get('droplet_radius_um', np.nan):.6g},"
+                        f"{s.get('recovery_amplitude', np.nan):.6g},"
+                        f"{s.get('half_time_s', np.nan):.6g},"
+                        f"{s.get('mobile_fraction_basis', '')}\n")
+            if "separate" in entry:
+                s = entry["separate"]
+                f.write(f"Separate,{s.get('filename', '')},{s.get('D_um2_per_s', np.nan):.6g},"
+                        f"{int(s.get('success', False))},{s.get('cost', np.nan):.6g},"
+                        f"{s.get('n_frames_fit', 0)},{s.get('frame_interval_s', np.nan):.6g},"
+                        f"{s.get('pixel_size_um', np.nan):.6g},{s.get('background', np.nan):.6g},"
+                        f"{s.get('pre_mean', np.nan):.6g},"
+                        f"{s.get('k_single_exp', np.nan):.6g},"
+                        f"{s.get('mobile_fraction', np.nan):.6g},"
+                        f"{s.get('immobile_fraction', np.nan):.6g},"
+                        f"{s.get('YM_single_exp', np.nan):.6g},"
+                        f"{s.get('Y0_single_exp', np.nan):.6g},"
+                        f"{s.get('K_pre', np.nan):.6g},"
+                        f"{s.get('bleach_fraction', np.nan):.6g},,"
+                        f"{s.get('droplet_radius_um', np.nan):.6g},"
+                        f"{s.get('recovery_amplitude', np.nan):.6g},"
+                        f"{s.get('half_time_s', np.nan):.6g},"
+                        f"{s.get('mobile_fraction_basis', '')}\n")
+
+
+def _arithmetic_filter_names(summary_dir, candidate_names, normalization_method,
+                             max_drop=0.1, max_jump=0.1, ignore_first_n=4,
+                             min_val=0.1, max_val=1.2, max_removed_frac=0.5):
+    """Return the subset of ``candidate_names`` (movie/bleach-point names) whose reported
+    FRAP recovery curve passes the arithmetic quality filters: no excessive frame-to-frame
+    jump/drop and (optionally) values within range. Reads the per-movie timeseries CSVs in
+    ``summary_dir``.
+
+    Safety guard: if the arithmetic thresholds would remove more than ``max_removed_frac``
+    of the candidates, the thresholds are clearly ill-suited to this dataset -- the filter
+    is skipped (all candidates kept) and a warning is logged, so a badly-tuned default can
+    never silently nuke a whole condition.
+    """
+    # Import the sibling ``combine`` module whether crop_pde runs as a package module
+    # (bleachdt.crop_pde) or as a standalone script (the GUI launches it via subprocess).
+    try:
+        from . import combine
+    except ImportError:
+        try:
+            from bleachdt import combine
+        except ImportError:
+            import combine
+    import pandas as pd
+
+    nm = (normalization_method or "both").lower()
+    col = "FRAP_norm_prebleach" if nm in ("prebleach", "both") else "FRAP_norm_wholedroplet"
+    alt = "FRAP_norm_wholedroplet" if col == "FRAP_norm_prebleach" else "FRAP_norm_prebleach"
+
+    curves = {}
+    for name in candidate_names:
+        f = os.path.join(summary_dir, f"{name}_frap_timeseries.csv")
+        if not os.path.isfile(f):
+            continue
+        try:
+            df = pd.read_csv(f)
+        except Exception:
+            continue
+        use = col if col in df.columns else (alt if alt in df.columns else None)
+        if use is None:
+            continue
+        curves[name] = np.asarray(df[use].to_numpy(), dtype=float)
+
+    if not curves:
+        return set(candidate_names)
+
+    maxlen = max(len(v) for v in curves.values())
+    data = {}
+    for name, v in curves.items():
+        if len(v) < maxlen:
+            v = np.concatenate([v, np.full(maxlen - len(v), np.nan)])
+        data[name] = v
+    cdf = pd.DataFrame(data)
+
+    try:
+        kept = combine.filter_jump_drop(
+            cdf, max_drop=max_drop, max_jump=max_jump, ignore_first_n=ignore_first_n)
+        kept = combine.filter_value_range(kept, min_val=min_val, max_val=max_val)
+        kept_names = set(kept.columns)
+    except Exception as e:
+        logger.warning(f"Arithmetic filter failed ({e}); keeping all candidates.")
+        return set(candidate_names)
+
+    n_cand = len(curves)
+    n_removed = n_cand - len(kept_names & set(curves))
+    if n_cand > 0 and (n_removed / n_cand) > max_removed_frac:
+        logger.warning(
+            f"Arithmetic filter would remove {n_removed}/{n_cand} curves "
+            f"(> {max_removed_frac:.0%}); thresholds look ill-suited to this data -- "
+            f"skipping arithmetic filter (K-exp outlier filter still applied).")
+        return set(candidate_names)
+
+    if n_removed > 0:
+        logger.info(f"Arithmetic filter removed {n_removed}/{n_cand} curves "
+                    f"(jump/drop/value-range).")
+    # Keep any candidate that has no readable curve (can't judge it -> don't drop it).
+    return kept_names | (set(candidate_names) - set(curves))
 
 
 def process_single_condition(
@@ -2955,6 +3359,16 @@ def process_single_condition(
     normalization_method="both",
     pre_bleach_frames=1,
     plot_skip=(),
+    analysis_channel_1=1,
+    output_all_channels=False,
+    skip_arithmetic_filter=False,
+    arith_max_drop=0.1,
+    arith_max_jump=0.1,
+    arith_ignore_first_n=4,
+    arith_min_val=0.1,
+    arith_max_val=1.2,
+    pde_enabled=True,
+    bleach_depth=0.0,
 ):
     """
     Process a single movie folder (subfolder containing TIF files from one movie).
@@ -3014,6 +3428,21 @@ def process_single_condition(
     summary_dir = os.path.join(results_dir, "summary")
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(summary_dir, exist_ok=True)
+
+    # Per-frame time axis for this movie: read the *_frame_times.csv sidecar written by the
+    # crop stage (variable acquisition cadence). None -> process_movie uses uniform timing.
+    cond_frame_times = None
+    try:
+        _ft_cands = glob.glob(os.path.join(results_dir, "*_frame_times.csv"))
+        if _ft_cands:
+            import pandas as _pd_ft
+            _ft_df = _pd_ft.read_csv(_ft_cands[0])
+            if "time_s" in _ft_df.columns:
+                cond_frame_times = np.asarray(_ft_df["time_s"].to_numpy(), dtype=float)
+                logger.info(f"Using variable frame-time axis from "
+                            f"{os.path.basename(_ft_cands[0])} ({len(cond_frame_times)} frames).")
+    except Exception as e:
+        logger.warning(f"Could not read frame-times sidecar: {e}")
 
     # First pass: analyze control movies to obtain global photobleach curve
     control_summaries = []
@@ -3222,6 +3651,10 @@ def process_single_condition(
     all_summaries_comb = []
 
     for path in frap_paths:
+      # Analyze the analysis channel, plus any usable secondary channels (two-channel).
+      for (measure_ch1, ch_suffix, collect_plots) in plan_channels(
+              path, analysis_channel_1, droplet_min_size, output_all_channels,
+              pre_bleach_frames):
         summary_sep, summary_comb = process_movie(
             path,
             movie_dir,
@@ -3250,14 +3683,25 @@ def process_single_condition(
             combined_model,
             T_switch_frame_arg,
             control_pb_curve=global_pb_curve,
-            image_collector=image_collector,
+            image_collector=(image_collector if collect_plots else None),
             summary_dir=summary_dir,
             normalization_method=normalization_method,
             pre_bleach_frames=pre_bleach_frames,
+            analysis_channel_1=analysis_channel_1,
+            measure_channel_1=measure_ch1,
+            channel_suffix=ch_suffix,
+            frame_times=cond_frame_times,
+            pde_enabled=pde_enabled,
+            bleach_depth=bleach_depth,
         )
         all_summaries_sep.append(summary_sep)
-        if combined_model and summary_comb is not None:
+        if pde_enabled and combined_model and summary_comb is not None:
             all_summaries_comb.append(summary_comb)
+
+    # Snapshot every detected droplet BEFORE any quality filtering, so we can also emit
+    # unfiltered "raw" outputs (metrics + curves) alongside the filtered main CSVs.
+    all_summaries_sep_unfiltered = list(all_summaries_sep)
+    all_summaries_comb_unfiltered = list(all_summaries_comb)
 
     # Filter out K_exp outliers (+/- 2 SD from mean) from all summaries
     # This filtering is applied early so outliers are excluded from all outputs
@@ -3301,6 +3745,38 @@ def process_single_condition(
                     # Match by filename
                     sep_filenames = {s.get("filename", "") for s in all_summaries_sep}
                     all_summaries_comb = [s for s in all_summaries_comb if s.get("filename", "") in sep_filenames]
+
+    # Second automatic quality filter: arithmetic jump/drop/value-range on the reported
+    # recovery curve (on top of the K-exp +/-2SD outlier filter above). Guarded so a
+    # badly-tuned default can't silently remove a whole condition.
+    if all_summaries_sep and not skip_arithmetic_filter:
+        try:
+            candidate_names = {s.get("filename", "") for s in all_summaries_sep}
+            kept_arith = _arithmetic_filter_names(
+                summary_dir, candidate_names, normalization_method,
+                max_drop=arith_max_drop, max_jump=arith_max_jump,
+                ignore_first_n=arith_ignore_first_n,
+                min_val=arith_min_val, max_val=arith_max_val)
+            before = len(all_summaries_sep)
+            all_summaries_sep = [s for s in all_summaries_sep
+                                 if s.get("filename", "") in kept_arith]
+            if combined_model and all_summaries_comb:
+                sep_fn = {s.get("filename", "") for s in all_summaries_sep}
+                all_summaries_comb = [s for s in all_summaries_comb
+                                      if s.get("filename", "") in sep_fn]
+            if len(all_summaries_sep) != before:
+                logger.info(f"Arithmetic filter kept {len(all_summaries_sep)}/{before} "
+                            f"FRAP movies after jump/drop/value-range.")
+        except Exception as e:
+            logger.warning(f"Arithmetic filter step failed ({e}); keeping K-exp-filtered set.")
+
+    # Raw (unfiltered) condition summary: every detected droplet, no quality filtering.
+    try:
+        _write_condition_summary_csv(
+            os.path.join(results_dir, "FRAP_condition_summary_unfiltered.csv"),
+            all_summaries_sep_unfiltered, all_summaries_comb_unfiltered, combined_model)
+    except Exception as e:
+        logger.warning(f"Could not write FRAP_condition_summary_unfiltered.csv: {e}")
 
     # Write combined CSV with Models column (Combined/Separate)
     if all_summaries_sep or (combined_model and all_summaries_comb):
@@ -3377,25 +3853,44 @@ def process_single_condition(
                             f"{s.get('half_time_s', np.nan):.6g},"
                             f"{s.get('mobile_fraction_basis', '')}\n")
 
-    # Consolidate FRAP + NoBleach + droplet location/geometry into one droplet_metrics.csv.
+    # Names (movies/bleach points) that survived the automatic quality filters. The main
+    # CSVs (droplet_metrics, FRAP_droplet_timeseries, *_stacked_all, *_averaged_all) hold
+    # ONLY these; the raw all-droplet copies (suffixed _all / _unfiltered) hold everything.
+    kept_names = {s.get("filename", "") for s in all_summaries_sep}
+
+    # Consolidate FRAP + NoBleach + droplet location/geometry into droplet_metrics.csv.
+    # Unfiltered (all droplets) first so it can still read droplet_locations.csv, then the
+    # filtered main file (which removes droplet_locations.csv afterwards).
     try:
-        consolidate_droplet_metrics(results_dir)
+        consolidate_droplet_metrics(
+            results_dir, summary_name="FRAP_condition_summary_unfiltered.csv",
+            out_name="droplet_metrics_all.csv", remove_locations=False)
+    except Exception as e:
+        logger.warning(f"Could not consolidate unfiltered droplet metrics: {e}")
+    try:
+        consolidate_droplet_metrics(results_dir)  # filtered -> droplet_metrics.csv
     except Exception as e:
         logger.warning(f"Could not consolidate droplet metrics: {e}")
 
-    # Per-movie stacked FRAP curves (ALL curves, unfiltered), one CSV per normalization
-    # method, written into the movie folder (built from the per-droplet timeseries while
-    # they still exist in the temporary summary folder).
+    # Per-movie stacked/averaged FRAP curves, one CSV per normalization method, built from
+    # the per-droplet timeseries while they still exist in the temporary summary folder.
+    # Filtered (main *_stacked_all / *_averaged_all) + unfiltered raw (_unfiltered).
     try:
         ts_files = glob.glob(os.path.join(summary_dir, "*_frap_timeseries.csv"))
-        write_normalization_stacked_csvs(ts_files, results_dir, normalization_method)
+        write_normalization_stacked_csvs(ts_files, results_dir, normalization_method,
+                                         keep_names=kept_names)
+        write_normalization_stacked_csvs(ts_files, results_dir, normalization_method,
+                                         keep_names=None, name_suffix="_unfiltered")
     except Exception as e:
         logger.warning(f"Could not write per-movie normalization stacked CSVs: {e}")
 
     # Consolidate the individual per-droplet timeseries into one FRAP and one NoBleach
-    # long CSV in the movie folder, then remove the temporary /summary subfolder.
+    # long CSV in the movie folder (filtered main + unfiltered raw), then remove the
+    # temporary /summary subfolder.
     try:
-        consolidate_timeseries_files(summary_dir, results_dir)
+        consolidate_timeseries_files(summary_dir, results_dir, keep_names=kept_names)
+        consolidate_timeseries_files(summary_dir, results_dir, keep_names=None,
+                                     name_suffix="_unfiltered")
         if os.path.isdir(summary_dir) and os.path.abspath(summary_dir) != os.path.abspath(results_dir):
             import shutil
             shutil.rmtree(summary_dir, ignore_errors=True)
@@ -3552,8 +4047,9 @@ def main():
                         help="Margin around droplet box before PDE (pixels)")
 
     # Frames & downsampling
-    parser.add_argument("--max-frames", type=int, default=30,
-                        help="Upper bound on post-bleach frames considered at all")
+    parser.add_argument("--max-frames", type=int, default=-1,
+                        help="Upper bound on post-bleach frames used for fitting. "
+                             "-1 (default) = use the whole movie (last frame).")
     parser.add_argument("--downsample-factor", type=int, default=2,
                         help="Downsample factor for PDE grid (default: 2)")
 
@@ -3563,11 +4059,36 @@ def main():
     parser.add_argument("--pre-bleach-frames", type=int, default=1,
                         help="Number of pre-bleach frames (averaged for the baseline; the first "
                              "post-bleach frame is frame N). Default 1.")
+    parser.add_argument("--analysis-channel", type=int, default=1,
+                        help="1-based channel used to build droplet/bleach ROIs and as the primary "
+                             "analysis channel (default 1).")
+    parser.add_argument("--two-channel", action="store_true",
+                        help="Also analyze the other channel(s) of multi-channel movies (measured "
+                             "with the analysis-channel ROIs; outputs suffixed _chN). Channels with no "
+                             "signal / that fail thresholding are skipped automatically.")
     parser.add_argument("--normalization-method",
                         choices=["prebleach", "wholedroplet", "both"], default="both",
                         help="Reported FRAP normalization: 'prebleach' (bleach-spot/pre-bleach), "
                              "'wholedroplet' (bleach/whole-droplet ratio, pre-bleach-normalized), "
                              "or 'both' (default). Raw intensities + both normalizations are always saved.")
+
+    # Automatic quality filtering. Main CSVs (droplet_metrics, FRAP_droplet_timeseries,
+    # *_stacked_all, *_averaged_all, FRAP_condition_summary) hold only curves that pass
+    # the K-exp +/-2SD outlier filter AND these arithmetic thresholds. Raw all-droplet
+    # copies (droplet_metrics_all.csv, *_unfiltered.csv) always keep everything.
+    parser.add_argument("--no-arithmetic-filter", action="store_true",
+                        help="Skip the arithmetic jump/drop/value-range quality filter "
+                             "(the K-exp +/-2SD outlier filter still applies).")
+    parser.add_argument("--arith-max-drop", type=float, default=0.1,
+                        help="Max allowed per-frame drop in the arithmetic filter (default 0.1).")
+    parser.add_argument("--arith-max-jump", type=float, default=0.1,
+                        help="Max allowed per-frame jump in the arithmetic filter (default 0.1).")
+    parser.add_argument("--arith-ignore-first-n", type=int, default=4,
+                        help="Initial frames ignored by the arithmetic jump/drop filter (default 4).")
+    parser.add_argument("--arith-min-val", type=float, default=0.1,
+                        help="Min allowed curve value in the arithmetic filter (default 0.1).")
+    parser.add_argument("--arith-max-val", type=float, default=1.2,
+                        help="Max allowed curve value in the arithmetic filter (default 1.2).")
 
     # Fit region & noise plot
     parser.add_argument("--fit-region", choices=["bleach", "droplet"], default="bleach",
@@ -3582,7 +4103,7 @@ def main():
                         help="Radius (pixels) to dilate bleach mask when defining PB region.")
     parser.add_argument("--pb-ratio-tolerance", type=float, default=0.05,
                         help="Tolerance on frame0/frame1 ratio when defining PB region "
-                             "(fractional, default 0.05 = ±5%).")
+                             "(fractional, default 0.05 = ±5%%).")
 
     # PDE / exponential frame windows
     parser.add_argument("--pde-first-frame", type=int, default=1,
@@ -3609,9 +4130,20 @@ def main():
     parser.add_argument("--no-nobleach-k-curves", action="store_true",
                         help="Do NOT save NoBleach_K_curves.tif (default: saved).")
 
-    # Combined model options
+    # PDE fitting toggle. When disabled, the (expensive) diffusion grid search is skipped
+    # entirely and the single-exponential plateau fit becomes the sole model for the movie.
+    parser.add_argument("--no-pde", action="store_true",
+                        help="Disable PDE diffusion fitting entirely (skip the D grid search). "
+                             "The single-exponential plateau fit becomes the only model, spanning "
+                             "the first post-bleach frame to the end of the movie (or --max-frames).")
+    parser.add_argument("--bleach-depth", type=float, default=0.0,
+                        help="Bleach depth (0-1). When > 0 the bleach ROI is the contiguous "
+                             "region where the pre/post ratio exceeds 1/(1-depth), and ALL its "
+                             "pixels are measured (replaces --ratio-percentile as the ROI selector).")
+
+    # Combined (mixed) model options. Independent of PDE on/off, but requires PDE enabled.
     parser.add_argument("--no-combined-model", action="store_true",
-                        help="Disable combined PDE + constrained exponential model output.")
+                        help="Disable combined (mixed) PDE + constrained exponential model output.")
     parser.add_argument("--T-switch-frame", type=int, default=None,
                         help=("Post-bleach frame index at which combined model switches "
                               "from PDE to exponential. "
@@ -3643,6 +4175,10 @@ def main():
     parser.add_argument("--crop-n-jobs", type=int, default=8)
     parser.add_argument("--crop-stabilize", action="store_true",
                         help="Enable stabilization during cropping (default off).")
+    parser.add_argument("--crop-stabilize-algorithm", type=str, default="lucas-kanade",
+                        choices=["ecc", "lucas-kanade", "lk"],
+                        help="Stabilization algorithm for the internal crop pass-through "
+                             "(only used if crop_pde runs droplet_crop on raw ND2s).")
     parser.add_argument("--crop-quiet", action="store_true",
                         help="Suppress per-droplet logging during cropping.")
 
@@ -3659,7 +4195,12 @@ def main():
 
     photobleach_correct = not args.no_photobleach_correct
     exp_plateau_fit = not args.no_exp_plateau_fit
-    combined_model = not args.no_combined_model
+    pde_enabled = not args.no_pde
+    # The mixed model requires PDE; force exp-only fitting when PDE is disabled.
+    combined_model = (not args.no_combined_model) and pde_enabled
+    if not pde_enabled:
+        # With PDE off, the exponential plateau fit is the only model; make sure it runs.
+        exp_plateau_fit = True
     T_switch_frame_arg = args.T_switch_frame
 
     # Diagnostic-plot toggles -> set of plot_type names to SKIP (per-movie + combined).
@@ -3722,8 +4263,11 @@ def main():
             cmd.append("--clear-borders")
         if args.crop_no_clear_borders:
             cmd.append("--no-clear-borders")
-        if args.crop_stabilize:
-            cmd.append("--stabilize")
+        # droplet_crop stabilizes by DEFAULT and has no "--stabilize" flag: disable it
+        # when not requested, and always pass the chosen algorithm.
+        if not args.crop_stabilize:
+            cmd.append("--no-stabilize")
+        cmd.extend(["--stabilize-algorithm", args.crop_stabilize_algorithm])
         if args.crop_quiet:
             cmd.append("--quiet")
 
@@ -3848,6 +4392,16 @@ def main():
             args.normalization_method,
             args.pre_bleach_frames,
             plot_skip,
+            args.analysis_channel,
+            args.two_channel,
+            args.no_arithmetic_filter,
+            args.arith_max_drop,
+            args.arith_max_jump,
+            args.arith_ignore_first_n,
+            args.arith_min_val,
+            args.arith_max_val,
+            pde_enabled,
+            args.bleach_depth,
         ))
 
     # Process movies in parallel or sequentially
@@ -3946,6 +4500,32 @@ def write_combined_outputs_at_root(results_root, frame_interval, normalization_m
     if header_written:
         logger.info(f"Wrote combined FRAP_condition_summary.csv to {combined_summary_path}")
 
+    # 1b. Same concatenation for the raw (unfiltered) per-movie summaries.
+    unf_files = []
+    for movie_name, path in summary_files:
+        p = os.path.join(os.path.dirname(path), "FRAP_condition_summary_unfiltered.csv")
+        if os.path.isfile(p):
+            unf_files.append((movie_name, p))
+    if unf_files:
+        unf_out = os.path.join(results_root, "FRAP_condition_summary_unfiltered.csv")
+        hw = False
+        with open(unf_out, "w", newline="") as f_out:
+            writer = csv_module.writer(f_out)
+            for movie_name, path in unf_files:
+                with open(path, "r") as f_in:
+                    reader = csv_module.reader(f_in)
+                    header = next(reader, None)
+                    if header is None:
+                        continue
+                    if not hw:
+                        writer.writerow(["movie"] + header)
+                        hw = True
+                    for row in reader:
+                        if len(row) > 0:
+                            writer.writerow([movie_name] + row)
+        if hw:
+            logger.info(f"Wrote combined FRAP_condition_summary_unfiltered.csv to {unf_out}")
+
     # 2-3. (Removed) The combined all_frap_curves.csv and the top-level FRAP_curves.tif
     #      overlay are no longer produced - the transposed per-normalization
     #      Pre-bleach_stacked_all.csv / Whole-droplet_stacked_all.csv (step 6) supersede
@@ -3998,12 +4578,20 @@ def write_combined_outputs_at_root(results_root, frame_interval, normalization_m
         # Read each movie's consolidated FRAP_droplet_timeseries.csv (long format; the
         # per-droplet /summary files were already merged + removed).
         all_ts = []
+        all_ts_unfiltered = []
         for d in os.listdir(results_root):
             long_csv = os.path.join(results_root, d, "FRAP_droplet_timeseries.csv")
             if os.path.isfile(long_csv):
                 all_ts.append(long_csv)
+            unf_csv = os.path.join(results_root, d, "FRAP_droplet_timeseries_unfiltered.csv")
+            if os.path.isfile(unf_csv):
+                all_ts_unfiltered.append(unf_csv)
+        # Per-movie files are already filtered, so the combined stacked is filtered too.
         if all_ts:
             write_normalization_stacked_csvs(all_ts, results_root, normalization_method)
+        if all_ts_unfiltered:
+            write_normalization_stacked_csvs(all_ts_unfiltered, results_root,
+                                             normalization_method, name_suffix="_unfiltered")
     except Exception as e:
         logger.warning(f"Could not write combined normalization stacked CSVs: {e}")
 
@@ -4025,6 +4613,22 @@ def write_combined_outputs_at_root(results_root, frame_interval, normalization_m
                 os.path.join(results_root, "droplet_metrics.csv"), index=False
             )
             logger.info("Wrote combined droplet_metrics.csv at results root.")
+        # Combined raw (all-droplet) metrics.
+        parts_all = []
+        for d in sorted(os.listdir(results_root)):
+            dm = os.path.join(results_root, d, "droplet_metrics_all.csv")
+            if os.path.isfile(dm):
+                try:
+                    df = pd.read_csv(dm)
+                    df.insert(0, "movie", d[:-8] if d.endswith("_results") else d)
+                    parts_all.append(df)
+                except Exception:
+                    continue
+        if parts_all:
+            pd.concat(parts_all, ignore_index=True, sort=False).to_csv(
+                os.path.join(results_root, "droplet_metrics_all.csv"), index=False
+            )
+            logger.info("Wrote combined droplet_metrics_all.csv at results root.")
     except Exception as e:
         logger.warning(f"Could not write combined droplet_metrics.csv: {e}")
 

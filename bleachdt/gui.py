@@ -39,7 +39,7 @@ try:
         QSplitter, QScrollArea, QFrame
     )
     from PySide6.QtCore import Qt, QThread, Signal, QTimer
-    from PySide6.QtGui import QFont, QPalette, QColor
+    from PySide6.QtGui import QFont, QPalette, QColor, QIcon, QPixmap
     QT_VERSION = "PySide6"
 except ImportError:
     try:
@@ -51,7 +51,7 @@ except ImportError:
             QSplitter, QScrollArea, QFrame
         )
         from PyQt6.QtCore import Qt, QThread, Signal, QTimer
-        from PyQt6.QtGui import QFont, QPalette, QColor
+        from PyQt6.QtGui import QFont, QPalette, QColor, QIcon, QPixmap
         QT_VERSION = "PyQt6"
     except ImportError:
         from PyQt5.QtWidgets import (
@@ -62,7 +62,7 @@ except ImportError:
             QSplitter, QScrollArea, QFrame
         )
         from PyQt5.QtCore import Qt, QThread, pyqtSignal as Signal, QTimer
-        from PyQt5.QtGui import QFont, QPalette, QColor
+        from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QPixmap
         QT_VERSION = "PyQt5"
 
 try:
@@ -71,6 +71,74 @@ try:
 except ImportError:
     PYQTGRAPH_AVAILABLE = False
     print("Warning: PyQtGraph not available. Filtering tab will be limited.")
+
+###############################################################################
+# Branding assets (BleachDt logo / wordmark)
+###############################################################################
+
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+
+def asset_path(name):
+    """Absolute path to a bundled asset in ``bleachdt/assets`` (empty string if missing)."""
+    p = os.path.join(_ASSETS_DIR, name)
+    return p if os.path.isfile(p) else ""
+
+
+def app_icon():
+    """Return the BleachDt QIcon assembled from the bundled multi-resolution PNGs.
+
+    Setting this on the QApplication makes it the taskbar/dock icon at runtime; setting it
+    on each window makes it the window/title-bar icon. Returns an empty QIcon if the assets
+    or the platform image plugins are unavailable, so it is always safe to call.
+    """
+    icon = QIcon()
+    try:
+        added = False
+        for name in ("icon_256.png", "icon_512.png", "icon_1024.png", "favicon.ico"):
+            p = asset_path(name)
+            if p:
+                pm = QPixmap(p)
+                if not pm.isNull():
+                    icon.addPixmap(pm)
+                    added = True
+        if not added:
+            return QIcon()
+    except Exception:
+        return QIcon()
+    return icon
+
+
+def wordmark_pixmap(height=34):
+    """Render the BleachDt wordmark SVG (logo + name) to a QPixmap at the given height.
+    Returns None if QtSvg or the asset is unavailable (callers fall back to text)."""
+    svg = asset_path("bleachDt-wordmark.svg")
+    if not svg:
+        return None
+    try:
+        if QT_VERSION == "PySide6":
+            from PySide6.QtSvg import QSvgRenderer
+        elif QT_VERSION == "PyQt6":
+            from PyQt6.QtSvg import QSvgRenderer
+        else:
+            from PyQt5.QtSvg import QSvgRenderer
+        from_qtgui = __import__(
+            {"PySide6": "PySide6.QtGui", "PyQt6": "PyQt6.QtGui"}.get(QT_VERSION, "PyQt5.QtGui"),
+            fromlist=["QPainter"])
+        QPainter = from_qtgui.QPainter
+        renderer = QSvgRenderer(svg)
+        size = renderer.defaultSize()
+        if size.height() <= 0:
+            return None
+        width = int(size.width() * (height / size.height()))
+        pm = QPixmap(width, height)
+        pm.fill(Qt.transparent)
+        painter = QPainter(pm)
+        renderer.render(painter)
+        painter.end()
+        return pm
+    except Exception:
+        return None
 
 ###############################################################################
 # Agent debug logging helper (for runtime instrumentation)
@@ -166,7 +234,7 @@ class DropletCropWorker(QThread):
                 "--min-area", str(p.get('min_area', 50.0)),
                 "--morph-open-radius", str(p.get('morph_open_radius', 1)),
                 "--smooth-sigma", str(p.get('smooth_sigma', 1.0)),
-                "--ratio-blur-sigma", str(p.get('ratio_blur_sigma', 0.7)),
+                "--ratio-blur-sigma", str(p.get('ratio_blur_sigma', 2.0)),
                 "--bleach-threshold", str(p.get('bleach_threshold', 1.2)),
                 "--crop-multiplier", str(p.get('crop_multiplier', 2.0)),
                 "--max-iterations", str(p.get('max_iterations', 2000)),
@@ -177,8 +245,11 @@ class DropletCropWorker(QThread):
                 "--max-shift-pixels", str(p.get('max_shift_pixels', 25.0)),
                 "--min-correlation", str(p.get('min_correlation', 0.8)),
                 "--refine-iterations", str(p.get('refine_iterations', 20)),
-                "--min-nobleach-diameter", str(p.get('min_nobleach_diameter', 10.0)),
-                "--min-nobleach-pc", str(p.get('min_nobleach_pc', 5.0)),
+                "--min-diameter", str(p.get('min_nobleach_diameter', 10.0)),
+                "--min-pc", str(p.get('min_nobleach_pc', 5.0)),
+                "--min-bleach-depth", str(p.get('min_bleach_depth', 0.3)),
+                "--pixel-size", str(p.get('pixel_size', 0.11)),
+                "--detect-blur-um", str(p.get('detect_blur_um', 1.0)),
                 "--n-jobs", str(p.get('n_jobs', 8)),
             ]
             
@@ -187,9 +258,12 @@ class DropletCropWorker(QThread):
             else:
                 cmd.append("--no-clear-borders")
             
-            if p.get('stabilize', False):
-                cmd.append("--stabilize")
-            
+            if not p.get('stabilize', True):
+                cmd.append("--no-stabilize")
+
+            if p.get('save_threshold_masks', False):
+                cmd.append("--save-threshold-masks")
+
             if p.get('quiet', False):
                 cmd.append("--quiet")
             
@@ -286,14 +360,25 @@ class FullAnalysisWorker(QThread):
                     "--output-root", results_root,
                     "--min-area", str(p.get('crop_min_area', 50.0)),
                     "--pre-bleach-frames", str(p.get('pre_bleach_frames', 1)),
+                    "--analysis-channel", str(p.get('analysis_channel', 1)),
                     "--morph-open-radius", str(p.get('crop_morph_open_radius', 1)),
                     "--smooth-sigma", str(p.get('crop_smooth_sigma', 1.0)),
-                    "--ratio-blur-sigma", str(p.get('crop_ratio_blur_sigma', 0.7)),
+                    # 8-bit detection image + physically-sized (micron) pre-threshold blur
+                    "--pixel-size", str(p.get('pixel_size', 0.11)),
+                    "--detect-blur-um", str(p.get('detect_blur_um', 1.0)),
+                    "--ratio-blur-sigma", str(p.get('crop_ratio_blur_sigma', 2.0)),
                     "--bleach-threshold", str(p.get('crop_bleach_threshold', 1.2)),
                     "--crop-multiplier", str(p.get('crop_crop_multiplier', 2.0)),
-                    "--min-nobleach-diameter", str(p.get('crop_min_nobleach_diameter', 10.0)),
-                    "--min-nobleach-pc", str(p.get('crop_min_nobleach_pc', 5.0)),
+                    "--min-diameter", str(p.get('crop_min_nobleach_diameter', 0.0)),
+                    "--min-pc", str(p.get('crop_min_nobleach_pc', 0.0)),
+                    "--bleach-spot-min-area", str(p.get('crop_bleach_spot_min_area', 5.0)),
+                    "--min-bleach-depth", str(p.get('crop_min_bleach_depth', 0.3)),
+                    "--frame-interval", str(p.get('frame_interval', 10.0)),
                     "--n-jobs", str(p.get('crop_n_jobs', 8)),
+                    # Frame-range stabilization (aligned to frame 0, applied to whole stack)
+                    "--stabilize-frame-start", str(p.get('stabilize_frame_start', 0)),
+                    "--stabilize-frame-end", str(p.get('stabilize_frame_end', -1)),
+                    "--stabilize-extrapolation", str(p.get('stabilize_extrapolation', 'hold')),
                     # Stabilization parameters
                     "--pyramid-levels", str(p.get('stab_pyramid_levels', 4)),
                     "--max-iterations", str(p.get('stab_max_iterations', 1000)),
@@ -305,6 +390,9 @@ class FullAnalysisWorker(QThread):
                     "--refine-iterations", str(p.get('stab_refine_iterations', 20)),
                 ]
                 
+                if p.get('save_threshold_masks', False):
+                    crop_cmd.append("--save-threshold-masks")
+
                 # Stabilization options
                 if not p.get('stabilize_enabled', True):
                     crop_cmd.append("--no-stabilize")
@@ -316,12 +404,17 @@ class FullAnalysisWorker(QThread):
                     if p.get('whole_pixel_stabilization', False):
                         crop_cmd.append("--whole-pixel-stabilization")
 
-                # Clear borders
-                if p.get('crop_clear_borders', True):
+                # Clear borders (default OFF now: keep every droplet, including edge-touching)
+                if p.get('crop_clear_borders', False):
                     crop_cmd.append("--clear-borders")
                 else:
                     crop_cmd.append("--no-clear-borders")
-                
+
+                # Variable acquisition timing (e.g. "300x0.1,35x10"); metadata is tried first.
+                _timing = str(p.get('timing_segments', '') or '').strip()
+                if _timing:
+                    crop_cmd.extend(["--timing-segments", _timing])
+
                 self.progress.emit(f"Running droplet_crop.py on {total_movies} movies...")
                 self.progress.emit(f"Command: {' '.join(crop_cmd)}\n")
                 
@@ -349,14 +442,8 @@ class FullAnalysisWorker(QThread):
                 
                 process.wait()
                 
-                if process.returncode != 0:
-                    self.progress.emit("\n--- Last lines of Droplet_Crop output ---")
-                    for L in last_lines:
-                        self.progress.emit(L)
-                    self.finished.emit(False, f"Droplet cropping failed with return code {process.returncode}. Check the log above for the error.")
-                    return
-                
-                # Check that at least one movie produced droplet TIFs (otherwise Crop_PDE will fail with "No TIF files found")
+                # Check that at least one movie produced droplet TIFs (otherwise Crop_PDE
+                # will fail with "No TIF files found").
                 import glob
                 any_droplets = False
                 for name in os.listdir(results_root):
@@ -368,12 +455,24 @@ class FullAnalysisWorker(QThread):
                         if tifs:
                             any_droplets = True
                             break
+
+                # A non-zero return code means AT LEAST ONE movie failed (e.g. a corrupt
+                # ND2). That must not sink the whole run: abort only if NOTHING was
+                # produced; otherwise warn and continue with the movies that succeeded.
                 if not any_droplets:
                     self.progress.emit("\n--- Last lines of Droplet_Crop output ---")
                     for L in last_lines:
                         self.progress.emit(L)
-                    self.finished.emit(False, "Droplet cropping produced no droplet TIF files (no droplets detected in any movie). Check the log above. Common causes: wrong bleach threshold, no droplets in frames, or image format/dimensions not (T, Y, X).")
+                    if process.returncode != 0:
+                        self.finished.emit(False, f"Droplet cropping failed for every movie (return code {process.returncode}) and produced no droplet TIF files. Check the log above for the per-file errors.")
+                    else:
+                        self.finished.emit(False, "Droplet cropping produced no droplet TIF files (no droplets detected in any movie). Check the log above. Common causes: wrong bleach depth, no droplets in frames, or image format/dimensions not (T, Y, X).")
                     return
+                elif process.returncode != 0:
+                    self.progress.emit(
+                        f"\nWARNING: droplet cropping reported errors (return code {process.returncode}) "
+                        f"for one or more movies (e.g. a corrupt/unreadable file). Continuing with the "
+                        f"movies that succeeded.\n")
                 
                 self.progress.emit("\nStep 1 complete. Cropped droplet stacks created.\n")
                 self.progress.emit("Step 2: Running PDE fitting analysis...\n")
@@ -402,6 +501,7 @@ class FullAnalysisWorker(QThread):
                 "--pixel-size", str(p.get('pixel_size', 0.11)),
                 "--frame-interval", str(p.get('frame_interval', 10.0)),
                 "--pre-bleach-frames", str(p.get('pre_bleach_frames', 1)),
+                "--analysis-channel", str(p.get('analysis_channel', 1)),
                 # D search
                 "--D-min", str(p.get('d_min', 0.001)),
                 "--D-max", str(p.get('d_max', 2.0)),
@@ -411,9 +511,10 @@ class FullAnalysisWorker(QThread):
                 # Masking
                 "--droplet-min-size", str(p.get('droplet_min_size', 50)),
                 "--ratio-percentile", str(p.get('ratio_percentile', 85.0)),
+                "--bleach-depth", str(p.get('bleach_depth', 0.0)),
                 "--crop-margin", str(p.get('crop_margin', 5)),
                 # Frames & downsampling
-                "--max-frames", str(p.get('max_frames', 30)),
+                "--max-frames", str(p.get('max_frames', -1)),
                 "--downsample-factor", str(p.get('downsample_factor', 2)),
                 # Fit region
                 "--fit-region", p.get('fit_region', 'bleach'),
@@ -438,6 +539,9 @@ class FullAnalysisWorker(QThread):
                 cmd.append("--no-photobleach-correct")
             if p.get('no_exp_plateau_fit', False):
                 cmd.append("--no-exp-plateau-fit")
+            # PDE fitting disabled -> skip the D grid search entirely (single-exp only).
+            if not p.get('pde_fitting_enabled', True):
+                cmd.append("--no-pde")
             if p.get('no_combined_model', False):
                 cmd.append("--no-combined-model")
             if p.get('t_switch_frame') is not None:
@@ -451,6 +555,8 @@ class FullAnalysisWorker(QThread):
                 cmd.append("--save-noise-pixels")
             if not p.get('save_nobleach_k_curves', True):
                 cmd.append("--no-nobleach-k-curves")
+            if p.get('two_channel', False):
+                cmd.append("--two-channel")
             
             # Droplet crop pass-through options
             if p.get('run_droplet_crop', False):
@@ -458,7 +564,7 @@ class FullAnalysisWorker(QThread):
                     "--crop-min-area", str(p.get('crop_min_area', 50.0)),
                     "--crop-morph-open-radius", str(p.get('crop_morph_open_radius', 1)),
                     "--crop-smooth-sigma", str(p.get('crop_smooth_sigma', 1.0)),
-                    "--crop-ratio-blur-sigma", str(p.get('crop_ratio_blur_sigma', 0.7)),
+                    "--crop-ratio-blur-sigma", str(p.get('crop_ratio_blur_sigma', 2.0)),
                     "--crop-bleach-threshold", str(p.get('crop_bleach_threshold', 1.2)),
                     "--crop-crop-multiplier", str(p.get('crop_crop_multiplier', 2.0)),
                     "--crop-max-iterations", str(p.get('crop_max_iterations', 2000)),
@@ -1137,6 +1243,9 @@ class FilteringTab(QWidget):
         self.scatter_items = []  # Store scatter plot items for hover detection
         self.source_directory = None  # Track where data is coming from
         self._plot_handlers_connected = False  # Avoid duplicate scene connections (fixes blank GUI)
+        self._mouse_move_proxy = None  # Throttled sigMouseMoved (prevents interaction crash)
+        self._mouse_click_proxy = None
+        self._in_hover = False  # Reentrancy guard for the hover handler
         
         self.init_ui()
     
@@ -1636,8 +1745,10 @@ class FilteringTab(QWidget):
     def create_plot(self):
         """Create scatter plot with selected parameters."""
         try:
-            # Allow hover/click handlers to be (re)connected for this plot session
-            self._plot_handlers_connected = False
+            # NOTE: do NOT reset self._plot_handlers_connected here. The PlotWidget scene
+            # persists across replots, so the throttled hover/click proxies only need to be
+            # connected once for the tab's lifetime. Re-connecting on every plot stacked
+            # duplicate handlers (N calls per mouse move) and was a cause of the crash.
             _agent_debug_log(
                 "create_plot_called",
                 data={
@@ -2563,130 +2674,196 @@ class FilteringTab(QWidget):
         return self.hover_tooltip
     
     def _setup_hover_handlers(self):
-        """Set up hover and click handlers for scatter plot items (once per plot session)."""
+        """Set up hover and click handlers for scatter plot items (once per plot session).
+
+        The mouse-move signal is routed through a pyqtgraph ``SignalProxy`` that rate-limits
+        it to ~60 Hz. Connecting a heavy handler directly to ``sigMouseMoved`` (which fires
+        on every pixel of motion) is what made the Filtering tab crash: rapid re-entrant
+        callbacks that touched scatter items being rebuilt/deleted would dereference freed
+        C++ objects and segfault. Throttling + the guards in the handlers fix that.
+        """
         if not PYQTGRAPH_AVAILABLE or self.plot_widget is None:
             return
-        # Connect only once per plot session to avoid duplicate connections and
-        # "Failed to disconnect" warnings that can leave the GUI in a bad state
         if self._plot_handlers_connected:
             return
         try:
             scene = self.plot_widget.scene()
             if scene is not None:
-                scene.sigMouseMoved.connect(self._on_plot_hover)
-                scene.sigMouseClicked.connect(self._on_plot_click)
+                # Keep references on self so the proxies aren't garbage-collected.
+                self._mouse_move_proxy = pg.SignalProxy(
+                    scene.sigMouseMoved, rateLimit=60, slot=self._on_plot_hover)
+                self._mouse_click_proxy = pg.SignalProxy(
+                    scene.sigMouseClicked, rateLimit=60, slot=self._on_plot_click)
                 self._plot_handlers_connected = True
         except Exception:
             pass  # Silently fail if scene not available
+
+    def _live_scatter_items(self):
+        """Return only scatter items whose underlying C++ object is still alive and still
+        attached to the current scene. Guards against segfaults from stale references left
+        behind when the plot is cleared/rebuilt."""
+        live = []
+        for item in list(self.scatter_items):
+            try:
+                if item is not None and item.scene() is not None:
+                    live.append(item)
+            except (RuntimeError, Exception):
+                # RuntimeError: wrapped C/C++ object has been deleted -> drop it.
+                continue
+        return live
     
-    def _on_plot_hover(self, pos):
-        """Handle mouse hover events on the plot to show tooltips."""
-        if self.current_plot is None or not self.scatter_items:
+    @staticmethod
+    def _scene_pos_from_event(evt):
+        """Extract a scene position from either a raw signal arg or a SignalProxy tuple."""
+        # SignalProxy delivers the signal args wrapped in a tuple: (pos,) for sigMouseMoved.
+        if isinstance(evt, (tuple, list)):
+            evt = evt[0] if evt else None
+        return evt
+
+    def _on_plot_hover(self, evt):
+        """Handle mouse hover to show a point tooltip. Fully guarded: any access to a
+        pyqtgraph item that was deleted during a plot rebuild raises RuntimeError, which we
+        swallow so the app can never crash on hover."""
+        if self._in_hover:
+            return  # Drop re-entrant calls (belt-and-suspenders with the SignalProxy).
+        self._in_hover = True
+        try:
+            if (not PYQTGRAPH_AVAILABLE or self.plot_widget is None
+                    or self.current_plot is None):
+                self._hide_tooltip()
+                return
+
+            live_items = self._live_scatter_items()
+            if not live_items:
+                self._hide_tooltip()
+                return
+
+            pos = self._scene_pos_from_event(evt)
+            if pos is None:
+                self._hide_tooltip()
+                return
+
+            vb = self.plot_widget.plotItem.vb
+            view_pos = vb.mapSceneToView(pos)
+            # Compute the hit threshold once (not per point).
+            x_range, y_range = self.plot_widget.viewRange()
+            x_threshold = (x_range[1] - x_range[0]) * 0.03
+            y_threshold = (y_range[1] - y_range[0]) * 0.03
+
+            x_param = self.current_plot['x_param']
+            y_param = self.current_plot['y_param']
+
+            min_dist = float('inf')
+            closest_info = None
+            for scatter_item in live_items:
+                try:
+                    points = scatter_item.points()
+                except (RuntimeError, Exception):
+                    continue
+                if points is None or len(points) == 0:
+                    continue
+                for point in points:
+                    try:
+                        px, py = point.pos()
+                    except (RuntimeError, Exception):
+                        continue
+                    if (abs(view_pos.x() - px) < x_threshold
+                            and abs(view_pos.y() - py) < y_threshold):
+                        dist = ((view_pos.x() - px) ** 2 + (view_pos.y() - py) ** 2) ** 0.5
+                        if dist < min_dist:
+                            min_dist = dist
+                            pdata = point.data()
+                            if pdata and 'filename' in pdata:
+                                closest_info = {'filename': pdata['filename'],
+                                                'x': px, 'y': py}
+
             tooltip = self._create_tooltip_label()
-            tooltip.hide()
-            return
-        
-        # Convert scene position to view coordinates
-        view_pos = self.plot_widget.plotItem.vb.mapSceneToView(pos)
-        
-        # Find the closest data point
-        min_dist = float('inf')
-        closest_info = None
-        
-        x_param = self.current_plot['x_param']
-        y_param = self.current_plot['y_param']
-        
-        # Check all scatter plot items
-        for scatter_item in self.scatter_items:
-            points = scatter_item.points()
-            if points is None or len(points) == 0:
-                continue
-            
-            for point in points:
-                px, py = point.pos()
-                dist = ((view_pos.x() - px)**2 + (view_pos.y() - py)**2)**0.5
-                
-                # Use a threshold distance (in data coordinates)
-                # Scale threshold based on view range
-                x_range, y_range = self.plot_widget.viewRange()
-                x_threshold = (x_range[1] - x_range[0]) * 0.03  # 3% of x range
-                y_threshold = (y_range[1] - y_range[0]) * 0.03  # 3% of y range
-                
-                if abs(view_pos.x() - px) < x_threshold and abs(view_pos.y() - py) < y_threshold:
-                    if dist < min_dist:
-                        min_dist = dist
-                        # Try to get filename from point data
-                        point_data = point.data()
-                        if point_data and 'filename' in point_data:
-                            closest_info = {
-                                'filename': point_data['filename'],
-                                'x': px,
-                                'y': py
-                            }
-        
-        # Show or hide tooltip
-        tooltip = self._create_tooltip_label()
-        if closest_info is not None:
-            # Format tooltip text
-            tooltip_text = f"{closest_info['filename']}\n{x_param}: {closest_info['x']:.4f}\n{y_param}: {closest_info['y']:.4f}"
-            tooltip.setText(tooltip_text)
-            
-            # Position tooltip near cursor
-            cursor_pos = self.plot_widget.mapFromGlobal(QApplication.instance().cursor().pos())
-            tooltip.move(cursor_pos.x() + 15, cursor_pos.y() + 15)
-            tooltip.show()
-            tooltip.raise_()
-        else:
-            tooltip.hide()
+            if closest_info is not None:
+                tooltip.setText(
+                    f"{closest_info['filename']}\n"
+                    f"{x_param}: {closest_info['x']:.4f}\n"
+                    f"{y_param}: {closest_info['y']:.4f}")
+                cursor_pos = self.plot_widget.mapFromGlobal(
+                    QApplication.instance().cursor().pos())
+                tooltip.move(cursor_pos.x() + 15, cursor_pos.y() + 15)
+                tooltip.show()
+                tooltip.raise_()
+            else:
+                tooltip.hide()
+        except (RuntimeError, Exception):
+            # Deleted C++ object or any transient plot-state error: never crash on hover.
+            self._hide_tooltip()
+        finally:
+            self._in_hover = False
+
+    def _hide_tooltip(self):
+        """Hide the hover tooltip if it exists, ignoring any teardown errors."""
+        try:
+            if self.hover_tooltip is not None:
+                self.hover_tooltip.hide()
+        except (RuntimeError, Exception):
+            pass
     
-    def _on_plot_click(self, event):
-        """Handle mouse click events on the plot to show point information."""
-        if self.current_plot is None or not self.scatter_items:
-            return
-        
-        # Convert scene position to view coordinates
-        view_pos = self.plot_widget.plotItem.vb.mapSceneToView(event.scenePos())
-        
-        # Find the closest data point
-        min_dist = float('inf')
-        closest_info = None
-        
-        x_param = self.current_plot['x_param']
-        y_param = self.current_plot['y_param']
-        
-        # Check all scatter plot items
-        for scatter_item in self.scatter_items:
-            points = scatter_item.points()
-            if points is None or len(points) == 0:
-                continue
-            
-            for point in points:
-                px, py = point.pos()
-                dist = ((view_pos.x() - px)**2 + (view_pos.y() - py)**2)**0.5
-                
-                # Use a threshold distance (in data coordinates)
-                x_range, y_range = self.plot_widget.viewRange()
-                x_threshold = (x_range[1] - x_range[0]) * 0.03
-                y_threshold = (y_range[1] - y_range[0]) * 0.03
-                
-                if abs(view_pos.x() - px) < x_threshold and abs(view_pos.y() - py) < y_threshold:
-                    if dist < min_dist:
-                        min_dist = dist
-                        point_data = point.data()
-                        if point_data and 'filename' in point_data:
-                            closest_info = {
-                                'filename': point_data['filename'],
-                                'x': px,
-                                'y': py
-                            }
-        
-        # Show clicked point info in a message box
-        if closest_info is not None:
-            info_text = f"Point Information:\n\n"
-            info_text += f"Filename: {closest_info['filename']}\n"
-            info_text += f"{x_param}: {closest_info['x']:.6f}\n"
-            info_text += f"{y_param}: {closest_info['y']:.6f}"
-            QMessageBox.information(self, "Point Details", info_text)
+    def _on_plot_click(self, evt):
+        """Handle a mouse click to show point info. Guarded the same way as the hover
+        handler so a click during a plot rebuild can't dereference a deleted item."""
+        try:
+            if (not PYQTGRAPH_AVAILABLE or self.plot_widget is None
+                    or self.current_plot is None):
+                return
+            live_items = self._live_scatter_items()
+            if not live_items:
+                return
+
+            # SignalProxy wraps the args in a tuple: (MouseClickEvent,).
+            event = evt[0] if isinstance(evt, (tuple, list)) and evt else evt
+            try:
+                scene_pos = event.scenePos()
+            except (AttributeError, RuntimeError, Exception):
+                return
+
+            vb = self.plot_widget.plotItem.vb
+            view_pos = vb.mapSceneToView(scene_pos)
+            x_range, y_range = self.plot_widget.viewRange()
+            x_threshold = (x_range[1] - x_range[0]) * 0.03
+            y_threshold = (y_range[1] - y_range[0]) * 0.03
+
+            x_param = self.current_plot['x_param']
+            y_param = self.current_plot['y_param']
+
+            min_dist = float('inf')
+            closest_info = None
+            for scatter_item in live_items:
+                try:
+                    points = scatter_item.points()
+                except (RuntimeError, Exception):
+                    continue
+                if points is None or len(points) == 0:
+                    continue
+                for point in points:
+                    try:
+                        px, py = point.pos()
+                    except (RuntimeError, Exception):
+                        continue
+                    if (abs(view_pos.x() - px) < x_threshold
+                            and abs(view_pos.y() - py) < y_threshold):
+                        dist = ((view_pos.x() - px) ** 2 + (view_pos.y() - py) ** 2) ** 0.5
+                        if dist < min_dist:
+                            min_dist = dist
+                            pdata = point.data()
+                            if pdata and 'filename' in pdata:
+                                closest_info = {'filename': pdata['filename'],
+                                                'x': px, 'y': py}
+
+            if closest_info is not None:
+                QMessageBox.information(
+                    self, "Point Details",
+                    f"Point Information:\n\n"
+                    f"Filename: {closest_info['filename']}\n"
+                    f"{x_param}: {closest_info['x']:.6f}\n"
+                    f"{y_param}: {closest_info['y']:.6f}")
+        except (RuntimeError, Exception):
+            pass  # Never crash on click.
     
     def get_included_filenames(self):
         """Return set of filenames that survived current filters (if available)."""
@@ -2791,9 +2968,9 @@ class AnalysisTab(QWidget):
         input_group.setLayout(input_layout)
         layout.addWidget(input_group)
         
-        # ============ CORE IMAGING PARAMETERS ============
-        imaging_section = CollapsibleSection("Core Imaging Parameters", initially_collapsed=False)
-        
+        # ============ IMAGING PARAMETERS ============
+        imaging_section = CollapsibleSection("Imaging Parameters", initially_collapsed=False)
+
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Pixel Size (µm):"))
         self.pixel_size_spin = QDoubleSpinBox()
@@ -2803,7 +2980,7 @@ class AnalysisTab(QWidget):
         self.pixel_size_spin.setDecimals(3)
         self.pixel_size_spin.setToolTip("Physical size of one pixel in micrometers")
         row1.addWidget(self.pixel_size_spin)
-        
+
         row1.addWidget(QLabel("Frame Interval (s):"))
         self.frame_interval_spin = QDoubleSpinBox()
         self.frame_interval_spin.setRange(0.1, 1000.0)
@@ -2824,19 +3001,87 @@ class AnalysisTab(QWidget):
         row1.addWidget(self.pre_bleach_frames_spin)
         row1.addStretch()
         imaging_section.addLayout(row1)
-        
+
+        row_ch = QHBoxLayout()
+        row_ch.addWidget(QLabel("Analysis channel:"))
+        self.analysis_channel_combo = QComboBox()
+        self.analysis_channel_combo.addItems(["Channel 1", "Channel 2"])
+        self.analysis_channel_combo.setToolTip(
+            "The channel used to detect droplets and build the bleach/droplet ROIs "
+            "(1-based). Single-channel movies always use channel 1."
+        )
+        row_ch.addWidget(self.analysis_channel_combo)
+
+        self.two_channel_check = QCheckBox("Two-channel analysis")
+        self.two_channel_check.setChecked(False)
+        self.two_channel_check.setToolTip(
+            "Also analyze the other channel(s) of 2-channel movies, measured with the "
+            "analysis-channel ROIs (outputs suffixed _ch1/_ch2). Mixed 1-/2-channel "
+            "datasets are handled automatically."
+        )
+        row_ch.addWidget(self.two_channel_check)
+        row_ch.addStretch()
+        imaging_section.addLayout(row_ch)
+
+        # Timing segments (moved here from the dissolved Droplet Cropping section).
+        row_timing = QHBoxLayout()
+        row_timing.addWidget(QLabel("Timing segments:"))
+        self.timing_segments_edit = QLineEdit()
+        self.timing_segments_edit.setPlaceholderText("e.g. 300x0.1,35x10  (optional)")
+        self.timing_segments_edit.setToolTip(
+            "Variable acquisition cadence used when the movie has no timing metadata: "
+            "COUNTxINTERVAL segments, e.g. '300x0.1,35x10' = 300 frames at 0.1 s then 35 "
+            "at 10 s. Leave blank to use metadata or the constant Frame Interval."
+        )
+        row_timing.addWidget(self.timing_segments_edit, 1)
+        imaging_section.addLayout(row_timing)
+
         layout.addWidget(imaging_section)
-        
-        # ============ IMAGE STABILIZATION PARAMETERS ============
+
+        # ============ IMAGE STABILIZATION ============
         stab_section = CollapsibleSection("Image Stabilization", initially_collapsed=True)
-        
-        # Enable stabilization checkbox and algorithm choice
-        stab_row1 = QHBoxLayout()
+
+        stab_row_en = QHBoxLayout()
         self.stabilize_check = QCheckBox("Enable Stabilization")
         self.stabilize_check.setChecked(True)  # Default ON
         self.stabilize_check.setToolTip("Stabilize entire movie before cropping (drift correction)")
-        stab_row1.addWidget(self.stabilize_check)
-        
+        stab_row_en.addWidget(self.stabilize_check)
+        stab_row_en.addStretch()
+        stab_section.addLayout(stab_row_en)
+
+        # Frame-range stabilization (moved here, ABOVE the algorithm). The defaults
+        # [start=0, end=-1, extrapolate=hold] cover the whole stack, so the pipeline defers
+        # to the traditional per-frame (full-range) stabilization; narrow the window only to
+        # estimate drift on a sub-range.
+        srange_layout = QHBoxLayout()
+        srange_layout.addWidget(QLabel("Stabilize frames [start:"))
+        self.stab_frame_start_spin = QSpinBox()
+        self.stab_frame_start_spin.setRange(0, 1000000)
+        self.stab_frame_start_spin.setValue(0)
+        self.stab_frame_start_spin.setToolTip("First frame of the drift-estimation window.")
+        srange_layout.addWidget(self.stab_frame_start_spin)
+        srange_layout.addWidget(QLabel("end:"))
+        self.stab_frame_end_spin = QSpinBox()
+        self.stab_frame_end_spin.setRange(-1, 1000000)
+        self.stab_frame_end_spin.setValue(-1)
+        self.stab_frame_end_spin.setToolTip(
+            "Last frame of the drift-estimation window (-1 = last). Drift is estimated on "
+            "frame 0 + [start,end] and applied to the whole stack, aligned to frame 0 (no "
+            "tail jump). Defaults (0, -1) = traditional whole-stack stabilization."
+        )
+        srange_layout.addWidget(self.stab_frame_end_spin)
+        srange_layout.addWidget(QLabel("] extrapolate:"))
+        self.stab_extrapolation_combo = QComboBox()
+        self.stab_extrapolation_combo.addItems(["hold", "linear", "poly"])
+        self.stab_extrapolation_combo.setToolTip(
+            "How to fill shifts outside the window: hold (jump-free), linear (end slope), "
+            "or poly (low-order drift model). Only used when the window is a sub-range."
+        )
+        srange_layout.addWidget(self.stab_extrapolation_combo)
+        srange_layout.addStretch()
+        stab_section.addLayout(srange_layout)
+
+        stab_row1 = QHBoxLayout()
         stab_row1.addWidget(QLabel("Algorithm:"))
         self.stabilize_algorithm_combo = QComboBox()
         self.stabilize_algorithm_combo.addItems(["Gradient (recommended)", "ECC (OpenCV)"])
@@ -2848,14 +3093,8 @@ class AnalysisTab(QWidget):
         stab_row1.addWidget(self.stabilize_algorithm_combo)
         stab_row1.addStretch()
         stab_section.addLayout(stab_row1)
-        # Stabilization always applies a single SUBPIXEL bilinear shift to all channels
-        # (smooth registration faithful to intensity changes). Whole-pixel application,
-        # which rounds shifts and causes visible "shaky" stair-stepping, is intentionally
-        # not exposed in the GUI (a --whole-pixel-stabilization CLI flag still exists).
 
-        # Reported FRAP normalization method. Both normalizations AND the raw
-        # intensities are always saved in the per-droplet timeseries CSV regardless;
-        # this only chooses the headline reported recovery curve.
+        # FRAP normalization + photobleach correction (photobleach moved here from fitting).
         norm_row = QHBoxLayout()
         norm_row.addWidget(QLabel("FRAP normalization:"))
         self.normalization_method_combo = QComboBox()
@@ -2870,10 +3109,12 @@ class AnalysisTab(QWidget):
             "Both normalizations and the raw RawIntDen values are always saved either way."
         )
         norm_row.addWidget(self.normalization_method_combo)
+        self.no_photobleach_check = QCheckBox("No Photobleach Correction")
+        self.no_photobleach_check.setToolTip("Skip photobleach correction")
+        norm_row.addWidget(self.no_photobleach_check)
         norm_row.addStretch()
         stab_section.addLayout(norm_row)
-        
-        # Stabilization parameters (shared)
+
         stab_row2 = QHBoxLayout()
         stab_row2.addWidget(QLabel("Pyramid Levels:"))
         self.stab_pyramid_spin = QSpinBox()
@@ -2881,14 +3122,14 @@ class AnalysisTab(QWidget):
         self.stab_pyramid_spin.setValue(4)
         self.stab_pyramid_spin.setToolTip("Number of pyramid levels for multi-scale stabilization")
         stab_row2.addWidget(self.stab_pyramid_spin)
-        
+
         stab_row2.addWidget(QLabel("Max Iterations:"))
         self.stab_iterations_spin = QSpinBox()
         self.stab_iterations_spin.setRange(10, 5000)
         self.stab_iterations_spin.setValue(500)
         self.stab_iterations_spin.setToolTip("Maximum iterations per frame")
         stab_row2.addWidget(self.stab_iterations_spin)
-        
+
         stab_row2.addWidget(QLabel("Error Tolerance:"))
         self.stab_epsilon_spin = QDoubleSpinBox()
         self.stab_epsilon_spin.setRange(1e-12, 1e-4)
@@ -2897,7 +3138,7 @@ class AnalysisTab(QWidget):
         self.stab_epsilon_spin.setSingleStep(1e-9)
         self.stab_epsilon_spin.setToolTip("Convergence threshold (lower = stricter)")
         stab_row2.addWidget(self.stab_epsilon_spin)
-        
+
         stab_row2.addWidget(QLabel("Template Update:"))
         self.stab_template_coeff_spin = QDoubleSpinBox()
         self.stab_template_coeff_spin.setRange(0.0, 1.0)
@@ -2909,8 +3150,7 @@ class AnalysisTab(QWidget):
         stab_row2.addWidget(self.stab_template_coeff_spin)
         stab_row2.addStretch()
         stab_section.addLayout(stab_row2)
-        
-        # ECC-specific parameters
+
         stab_row3 = QHBoxLayout()
         stab_row3.addWidget(QLabel("Pre-smooth Sigma:"))
         self.stab_pre_smooth_spin = QDoubleSpinBox()
@@ -2919,7 +3159,7 @@ class AnalysisTab(QWidget):
         self.stab_pre_smooth_spin.setDecimals(2)
         self.stab_pre_smooth_spin.setToolTip("Gaussian smoothing before alignment (0 = none)")
         stab_row3.addWidget(self.stab_pre_smooth_spin)
-        
+
         stab_row3.addWidget(QLabel("Max Shift (px):"))
         self.stab_max_shift_spin = QDoubleSpinBox()
         self.stab_max_shift_spin.setRange(1.0, 100.0)
@@ -2927,7 +3167,7 @@ class AnalysisTab(QWidget):
         self.stab_max_shift_spin.setDecimals(1)
         self.stab_max_shift_spin.setToolTip("Maximum allowed shift in pixels")
         stab_row3.addWidget(self.stab_max_shift_spin)
-        
+
         stab_row3.addWidget(QLabel("Min Correlation:"))
         self.stab_min_corr_spin = QDoubleSpinBox()
         self.stab_min_corr_spin.setRange(0.0, 1.0)
@@ -2935,7 +3175,7 @@ class AnalysisTab(QWidget):
         self.stab_min_corr_spin.setDecimals(2)
         self.stab_min_corr_spin.setToolTip("Minimum correlation to accept alignment (ECC)")
         stab_row3.addWidget(self.stab_min_corr_spin)
-        
+
         stab_row3.addWidget(QLabel("Refine Iterations:"))
         self.stab_refine_spin = QSpinBox()
         self.stab_refine_spin.setRange(1, 100)
@@ -2944,104 +3184,210 @@ class AnalysisTab(QWidget):
         stab_row3.addWidget(self.stab_refine_spin)
         stab_row3.addStretch()
         stab_section.addLayout(stab_row3)
-        
+
         layout.addWidget(stab_section)
-        
-        # ============ DROPLET CROPPING PARAMETERS ============
-        crop_section = CollapsibleSection("Droplet Cropping", initially_collapsed=True)
-        
-        # Run crop checkbox
-        crop_check_layout = QHBoxLayout()
-        self.run_droplet_crop_check = QCheckBox("Save droplet TIF stacks")
-        self.run_droplet_crop_check.setToolTip("Save individual droplet TIF stacks to droplet_stacks/ subfolder")
-        crop_check_layout.addWidget(self.run_droplet_crop_check)
-        
-        self.crop_clear_borders_check = QCheckBox("Clear Borders")
-        self.crop_clear_borders_check.setChecked(True)
-        self.crop_clear_borders_check.setToolTip("Remove droplets touching image borders")
-        crop_check_layout.addWidget(self.crop_clear_borders_check)
-        crop_check_layout.addStretch()
-        crop_section.addLayout(crop_check_layout)
-        
-        # Detection parameters
+
+        # ============ DETECTION AND FILTERING ============
+        filter_section = CollapsibleSection("Detection and Filtering", initially_collapsed=False)
+
+        # Detection sizes (min droplet area = same for FRAP and NoBleach).
         det_layout = QHBoxLayout()
-        det_layout.addWidget(QLabel("Min Area:"))
+        det_layout.addWidget(QLabel("Minimum droplet area (px):"))
         self.crop_min_area_spin = QDoubleSpinBox()
         self.crop_min_area_spin.setRange(1.0, 10000.0)
         self.crop_min_area_spin.setValue(50.0)
-        self.crop_min_area_spin.setToolTip("Minimum droplet area in pixels")
+        self.crop_min_area_spin.setToolTip(
+            "Minimum droplet area (px) for detection on the pre-bleach frame. Applies to "
+            "both FRAP and NoBleach droplets."
+        )
         det_layout.addWidget(self.crop_min_area_spin)
-        
-        det_layout.addWidget(QLabel("Bleach Threshold:"))
+
+        det_layout.addWidget(QLabel("Min mask size (px):"))
+        self.droplet_min_size_spin = QSpinBox()
+        self.droplet_min_size_spin.setRange(1, 10000)
+        self.droplet_min_size_spin.setValue(50)
+        self.droplet_min_size_spin.setToolTip(
+            "Minimum droplet size (px) for the per-crop Otsu droplet mask used in the "
+            "fitting stage."
+        )
+        det_layout.addWidget(self.droplet_min_size_spin)
+        det_layout.addStretch()
+        filter_section.addLayout(det_layout)
+
+        # Bleach detection: single merged "Bleach depth" control + spot min area. The same
+        # depth defines the contiguous bleach ROI whose pixels are measured for recovery.
+        bleach_layout = QHBoxLayout()
+        bleach_layout.addWidget(QLabel("Bleach depth:"))
+        self.crop_min_bleach_depth_spin = QDoubleSpinBox()
+        self.crop_min_bleach_depth_spin.setRange(0.0, 1.0)
+        self.crop_min_bleach_depth_spin.setSingleStep(0.05)
+        self.crop_min_bleach_depth_spin.setDecimals(2)
+        self.crop_min_bleach_depth_spin.setValue(0.3)
+        self.crop_min_bleach_depth_spin.setToolTip(
+            "Minimum fractional intensity drop (1 - post/pre) that defines a bleach spot. A "
+            "droplet carrying such a spot is FRAP; the same threshold defines the contiguous "
+            "bleach ROI whose pixels are measured. Replaces the old bleach-threshold + "
+            "ratio-percentile controls."
+        )
+        bleach_layout.addWidget(self.crop_min_bleach_depth_spin)
+
+        bleach_layout.addWidget(QLabel("Bleach spot min area (px):"))
+        self.crop_bleach_spot_min_area_spin = QDoubleSpinBox()
+        self.crop_bleach_spot_min_area_spin.setRange(0.0, 100000.0)
+        self.crop_bleach_spot_min_area_spin.setValue(5.0)
+        self.crop_bleach_spot_min_area_spin.setToolTip(
+            "Minimum area (px) of a bleach spot in the pre/post ratio image; a droplet "
+            "overlapping a spot is FRAP, else NoBleach."
+        )
+        bleach_layout.addWidget(self.crop_bleach_spot_min_area_spin)
+        bleach_layout.addStretch()
+        filter_section.addLayout(bleach_layout)
+
+        # General droplet quality filters (apply to ALL droplets: FRAP + NoBleach).
+        pc_layout = QHBoxLayout()
+        pc_layout.addWidget(QLabel("Minimum partition coefficient:"))
+        self.crop_min_nb_pc_spin = QDoubleSpinBox()
+        self.crop_min_nb_pc_spin.setRange(0.0, 1000.0)
+        self.crop_min_nb_pc_spin.setValue(0.0)
+        self.crop_min_nb_pc_spin.setToolTip(
+            "Minimum partition coefficient (droplet/background) for ALL droplets (FRAP and "
+            "NoBleach). 0 keeps everything."
+        )
+        pc_layout.addWidget(self.crop_min_nb_pc_spin)
+
+        pc_layout.addWidget(QLabel("Minimum droplet diameter (px):"))
+        self.crop_min_nb_diam_spin = QDoubleSpinBox()
+        self.crop_min_nb_diam_spin.setRange(0.0, 1000.0)
+        self.crop_min_nb_diam_spin.setValue(0.0)
+        self.crop_min_nb_diam_spin.setToolTip(
+            "Minimum equivalent diameter (px) for ALL droplets (FRAP and NoBleach). "
+            "0 keeps everything."
+        )
+        pc_layout.addWidget(self.crop_min_nb_diam_spin)
+        pc_layout.addStretch()
+        filter_section.addLayout(pc_layout)
+
+        # Save / QC options.
+        save_layout = QHBoxLayout()
+        self.crop_clear_borders_check = QCheckBox("Clear Borders")
+        self.crop_clear_borders_check.setChecked(False)
+        self.crop_clear_borders_check.setToolTip(
+            "Remove droplets whose body touches the image edge. OFF by default so large "
+            "and edge-touching droplets are kept (flagged via touches_image_edge instead)."
+        )
+        save_layout.addWidget(self.crop_clear_borders_check)
+
+        self.run_droplet_crop_check = QCheckBox("Save droplet TIF stacks")
+        self.run_droplet_crop_check.setToolTip("Save individual droplet TIF stacks to droplet_stacks/ subfolder")
+        save_layout.addWidget(self.run_droplet_crop_check)
+
+        self.save_threshold_qc_check = QCheckBox("Save threshold QC stacks")
+        self.save_threshold_qc_check.setChecked(False)
+        self.save_threshold_qc_check.setToolTip(
+            "Save a whole-field-of-view threshold check per movie "
+            "(threshold_masks_<movie>.tif: detection 8-bit + droplet mask + bleach-spot "
+            "mask). Distinct from the per-droplet FRAP_droplet_masks.tif."
+        )
+        save_layout.addWidget(self.save_threshold_qc_check)
+        save_layout.addStretch()
+        filter_section.addLayout(save_layout)
+
+        # Curve-acceptance filters (arithmetic thresholds on the recovery curves).
+        drop_layout = QHBoxLayout()
+        drop_layout.addWidget(QLabel("Max Drop:"))
+        self.max_drop_spin = QDoubleSpinBox()
+        self.max_drop_spin.setRange(0.0, 1.0)
+        self.max_drop_spin.setSingleStep(0.01)
+        self.max_drop_spin.setValue(0.1)
+        self.max_drop_spin.setDecimals(3)
+        self.max_drop_spin.setToolTip("Maximum intensity drop between frames to accept a curve")
+        drop_layout.addWidget(self.max_drop_spin)
+
+        drop_layout.addWidget(QLabel("Max Jump:"))
+        self.max_jump_spin = QDoubleSpinBox()
+        self.max_jump_spin.setRange(0.0, 1.0)
+        self.max_jump_spin.setSingleStep(0.01)
+        self.max_jump_spin.setValue(0.1)
+        self.max_jump_spin.setDecimals(3)
+        self.max_jump_spin.setToolTip("Maximum intensity jump between frames to accept a curve")
+        drop_layout.addWidget(self.max_jump_spin)
+
+        drop_layout.addWidget(QLabel("Ignore First N:"))
+        self.ignore_first_n_spin = QSpinBox()
+        self.ignore_first_n_spin.setRange(0, 100)
+        self.ignore_first_n_spin.setValue(4)
+        self.ignore_first_n_spin.setToolTip("Frames to ignore in jump/drop analysis")
+        drop_layout.addWidget(self.ignore_first_n_spin)
+        drop_layout.addStretch()
+        filter_section.addLayout(drop_layout)
+
+        val_layout = QHBoxLayout()
+        val_layout.addWidget(QLabel("Min Value:"))
+        self.min_val_spin = QDoubleSpinBox()
+        self.min_val_spin.setRange(-10.0, 10.0)
+        self.min_val_spin.setSingleStep(0.1)
+        self.min_val_spin.setValue(0.1)
+        self.min_val_spin.setDecimals(3)
+        self.min_val_spin.setToolTip("Minimum allowed intensity value")
+        val_layout.addWidget(self.min_val_spin)
+
+        val_layout.addWidget(QLabel("Max Value:"))
+        self.max_val_spin = QDoubleSpinBox()
+        self.max_val_spin.setRange(-10.0, 10.0)
+        self.max_val_spin.setSingleStep(0.1)
+        self.max_val_spin.setValue(1.2)
+        self.max_val_spin.setDecimals(3)
+        self.max_val_spin.setToolTip("Maximum allowed intensity value")
+        val_layout.addWidget(self.max_val_spin)
+
+        self.no_filter_check = QCheckBox("Skip detection thresholds")
+        self.no_filter_check.setToolTip("Include all curves without applying detection thresholds")
+        val_layout.addWidget(self.no_filter_check)
+        val_layout.addStretch()
+        filter_section.addLayout(val_layout)
+
+        # Retired controls kept instantiated (not shown) for backward-compatible wiring:
+        #   crop_bleach_thresh_spin -> fixed ratio floor; the bleach call is driven by Bleach depth.
+        #   crop_multiplier_spin    -> fixed crop-window multiplier (removed from the UI).
+        #   ratio_percentile_spin   -> legacy bleach-ROI selector (superseded by Bleach depth).
         self.crop_bleach_thresh_spin = QDoubleSpinBox()
         self.crop_bleach_thresh_spin.setRange(0.1, 10.0)
-        self.crop_bleach_thresh_spin.setValue(1.2)
-        self.crop_bleach_thresh_spin.setDecimals(2)
-        self.crop_bleach_thresh_spin.setToolTip("FRAP if mean(frame0/frame1) > threshold")
-        det_layout.addWidget(self.crop_bleach_thresh_spin)
-        
-        det_layout.addWidget(QLabel("Crop Mult:"))
+        self.crop_bleach_thresh_spin.setValue(1.0)
         self.crop_multiplier_spin = QDoubleSpinBox()
         self.crop_multiplier_spin.setRange(1.0, 10.0)
         self.crop_multiplier_spin.setValue(2.0)
-        self.crop_multiplier_spin.setDecimals(1)
-        self.crop_multiplier_spin.setToolTip("Square side = multiplier × equivalent diameter")
-        det_layout.addWidget(self.crop_multiplier_spin)
-        det_layout.addStretch()
-        crop_section.addLayout(det_layout)
-        
-        # NoBleach filtering
-        nb_layout = QHBoxLayout()
-        nb_layout.addWidget(QLabel("Min NoBleach Diam:"))
-        self.crop_min_nb_diam_spin = QDoubleSpinBox()
-        self.crop_min_nb_diam_spin.setRange(0.0, 1000.0)
-        self.crop_min_nb_diam_spin.setValue(10.0)
-        self.crop_min_nb_diam_spin.setToolTip("Minimum diameter for NoBleach droplets")
-        nb_layout.addWidget(self.crop_min_nb_diam_spin)
-        
-        nb_layout.addWidget(QLabel("Min NoBleach PC:"))
-        self.crop_min_nb_pc_spin = QDoubleSpinBox()
-        self.crop_min_nb_pc_spin.setRange(0.0, 1000.0)
-        self.crop_min_nb_pc_spin.setValue(5.0)
-        self.crop_min_nb_pc_spin.setToolTip("Minimum partition coefficient for NoBleach")
-        nb_layout.addWidget(self.crop_min_nb_pc_spin)
-        
-        nb_layout.addWidget(QLabel("N Jobs:"))
-        self.crop_n_jobs_spin = QSpinBox()
-        self.crop_n_jobs_spin.setRange(1, 64)
-        self.crop_n_jobs_spin.setValue(8)
-        self.crop_n_jobs_spin.setToolTip("Number of parallel workers")
-        nb_layout.addWidget(self.crop_n_jobs_spin)
-        nb_layout.addStretch()
-        crop_section.addLayout(nb_layout)
-        
-        layout.addWidget(crop_section)
-        
-        # ============ PDE FITTING PARAMETERS ============
-        pde_section = CollapsibleSection("PDE Fitting", initially_collapsed=True)
-        
-        # D search parameters
+        self.ratio_percentile_spin = QDoubleSpinBox()
+        self.ratio_percentile_spin.setRange(0.0, 100.0)
+        self.ratio_percentile_spin.setValue(85.0)
+
+        layout.addWidget(filter_section)
+
+        # ============ CURVE FITTING ============
+        pde_section = CollapsibleSection("Curve Fitting", initially_collapsed=True)
+
+        # Diffusion (PDE) search bounds. These bound the PDE-CALCULATED diffusion
+        # coefficient D; they have no effect when PDE fitting is disabled.
         d_layout = QHBoxLayout()
-        d_layout.addWidget(QLabel("D Min (µm²/s):"))
+        d_layout.addWidget(QLabel("PDE D Min (µm²/s):"))
         self.d_min_spin = QDoubleSpinBox()
         self.d_min_spin.setRange(0.0001, 10.0)
         self.d_min_spin.setSingleStep(0.001)
         self.d_min_spin.setValue(0.001)
         self.d_min_spin.setDecimals(4)
-        self.d_min_spin.setToolTip("Minimum diffusion coefficient to search")
+        self.d_min_spin.setToolTip("Minimum PDE-calculated diffusion coefficient to search")
         d_layout.addWidget(self.d_min_spin)
-        
-        d_layout.addWidget(QLabel("D Max (µm²/s):"))
+
+        d_layout.addWidget(QLabel("PDE D Max (µm²/s):"))
         self.d_max_spin = QDoubleSpinBox()
         self.d_max_spin.setRange(0.001, 100.0)
         self.d_max_spin.setSingleStep(0.1)
         self.d_max_spin.setValue(2.0)
         self.d_max_spin.setDecimals(3)
-        self.d_max_spin.setToolTip("Maximum diffusion coefficient to search")
+        self.d_max_spin.setToolTip("Maximum PDE-calculated diffusion coefficient to search")
         d_layout.addWidget(self.d_max_spin)
         d_layout.addStretch()
         pde_section.addLayout(d_layout)
-        
+
         d_grid_layout = QHBoxLayout()
         d_grid_layout.addWidget(QLabel("D Grid Size:"))
         self.d_grid_size_spin = QSpinBox()
@@ -3049,14 +3395,14 @@ class AnalysisTab(QWidget):
         self.d_grid_size_spin.setValue(25)
         self.d_grid_size_spin.setToolTip("Points in coarse D grid (lower = faster)")
         d_grid_layout.addWidget(self.d_grid_size_spin)
-        
+
         d_grid_layout.addWidget(QLabel("D Refine Grid:"))
         self.d_refine_grid_spin = QSpinBox()
         self.d_refine_grid_spin.setRange(10, 500)
         self.d_refine_grid_spin.setValue(100)
         self.d_refine_grid_spin.setToolTip("Points in refined D grid (lower = faster)")
         d_grid_layout.addWidget(self.d_refine_grid_spin)
-        
+
         d_grid_layout.addWidget(QLabel("Downsample:"))
         self.downsample_spin = QSpinBox()
         self.downsample_spin.setRange(1, 10)
@@ -3065,35 +3411,20 @@ class AnalysisTab(QWidget):
         d_grid_layout.addWidget(self.downsample_spin)
         d_grid_layout.addStretch()
         pde_section.addLayout(d_grid_layout)
-        
-        # Masking parameters
+
         mask_layout = QHBoxLayout()
-        mask_layout.addWidget(QLabel("Min Droplet Size:"))
-        self.droplet_min_size_spin = QSpinBox()
-        self.droplet_min_size_spin.setRange(1, 10000)
-        self.droplet_min_size_spin.setValue(50)
-        self.droplet_min_size_spin.setToolTip("Minimum droplet size in pixels")
-        mask_layout.addWidget(self.droplet_min_size_spin)
-        
-        mask_layout.addWidget(QLabel("Ratio Percentile:"))
-        self.ratio_percentile_spin = QDoubleSpinBox()
-        self.ratio_percentile_spin.setRange(0.0, 100.0)
-        self.ratio_percentile_spin.setSingleStep(1.0)
-        self.ratio_percentile_spin.setValue(85.0)
-        self.ratio_percentile_spin.setDecimals(1)
-        self.ratio_percentile_spin.setToolTip("Percentile for bleach ROI")
-        mask_layout.addWidget(self.ratio_percentile_spin)
-        
         mask_layout.addWidget(QLabel("Max Frames:"))
         self.max_frames_spin = QSpinBox()
-        self.max_frames_spin.setRange(5, 1000)
-        self.max_frames_spin.setValue(30)
-        self.max_frames_spin.setToolTip("Upper bound on post-bleach frames")
+        self.max_frames_spin.setRange(-1, 1000)
+        self.max_frames_spin.setValue(-1)
+        self.max_frames_spin.setToolTip(
+            "Upper bound on post-bleach frames for fitting. -1 (default) = use the whole "
+            "movie (last frame)."
+        )
         mask_layout.addWidget(self.max_frames_spin)
         mask_layout.addStretch()
         pde_section.addLayout(mask_layout)
-        
-        # PDE/Exp frame windows
+
         frame_layout = QHBoxLayout()
         frame_layout.addWidget(QLabel("PDE Frames:"))
         self.pde_first_frame_spin = QSpinBox()
@@ -3107,46 +3438,52 @@ class AnalysisTab(QWidget):
         self.pde_last_frame_spin.setValue(7)
         self.pde_last_frame_spin.setToolTip("Last frame for PDE")
         frame_layout.addWidget(self.pde_last_frame_spin)
-        
+
         frame_layout.addWidget(QLabel("Exp Frames:"))
         self.exp_first_frame_spin = QSpinBox()
         self.exp_first_frame_spin.setRange(1, 100)
         self.exp_first_frame_spin.setValue(8)
-        self.exp_first_frame_spin.setToolTip("First frame for exponential fit")
+        self.exp_first_frame_spin.setToolTip("First frame for exponential fit (mixed model only)")
         frame_layout.addWidget(self.exp_first_frame_spin)
         frame_layout.addWidget(QLabel("-"))
         self.exp_last_frame_spin = QSpinBox()
         self.exp_last_frame_spin.setRange(1, 100)
         self.exp_last_frame_spin.setValue(30)
-        self.exp_last_frame_spin.setToolTip("Last frame for exponential fit")
+        self.exp_last_frame_spin.setToolTip("Last frame for exponential fit (mixed model only)")
         frame_layout.addWidget(self.exp_last_frame_spin)
         frame_layout.addStretch()
         pde_section.addLayout(frame_layout)
-        
-        # Model options
+
         model_layout = QHBoxLayout()
         self.pde_fitting_check = QCheckBox("Enable PDE Fitting")
         self.pde_fitting_check.setChecked(True)  # Default ON
         self.pde_fitting_check.setToolTip("Enable PDE diffusion fitting. Uncheck to use only single exponential fits.")
         self.pde_fitting_check.stateChanged.connect(self._on_pde_fitting_changed)
         model_layout.addWidget(self.pde_fitting_check)
-        
-        self.no_photobleach_check = QCheckBox("No Photobleach Correction")
-        self.no_photobleach_check.setToolTip("Skip photobleach correction")
-        model_layout.addWidget(self.no_photobleach_check)
-        
+
+        self.mixed_model_check = QCheckBox("Mixed Model")
+        self.mixed_model_check.setChecked(False)  # Default OFF
+        self.mixed_model_check.setToolTip(
+            "Fit the combined PDE + constrained-exponential (mixed) model. "
+            "Requires PDE fitting to be enabled; used only when checked."
+        )
+        model_layout.addWidget(self.mixed_model_check)
+
         self.no_exp_plateau_check = QCheckBox("No Exp Plateau")
         self.no_exp_plateau_check.setToolTip("Skip exponential plateau fitting")
         model_layout.addWidget(self.no_exp_plateau_check)
-        
-        model_layout.addWidget(QLabel("N Jobs:"))
+        model_layout.addStretch()
+        pde_section.addLayout(model_layout)
+
+        # Retired here (moved to Image Stabilization / next to Run buttons) but kept
+        # instantiated for backward-compatible wiring:
+        #   n_jobs_conditions_spin / crop_n_jobs_spin -> driven by the single Process number.
         self.n_jobs_conditions_spin = QSpinBox()
         self.n_jobs_conditions_spin.setRange(1, 64)
         self.n_jobs_conditions_spin.setValue(8)
-        self.n_jobs_conditions_spin.setToolTip("Parallel workers for conditions")
-        model_layout.addWidget(self.n_jobs_conditions_spin)
-        model_layout.addStretch()
-        pde_section.addLayout(model_layout)
+        self.crop_n_jobs_spin = QSpinBox()
+        self.crop_n_jobs_spin.setRange(1, 64)
+        self.crop_n_jobs_spin.setValue(8)
 
         # Diagnostic-plot save toggles (apply to per-movie and combined outputs).
         plot_row = QHBoxLayout()
@@ -3172,68 +3509,8 @@ class AnalysisTab(QWidget):
         plot_row.addWidget(self.save_nobleach_k_check)
         plot_row.addStretch()
         pde_section.addLayout(plot_row)
-        
+
         layout.addWidget(pde_section)
-        
-        # ============ DETECTION PARAMETERS ============
-        filter_section = CollapsibleSection("Detection Parameters", initially_collapsed=False)
-        
-        # Max drop/jump
-        drop_layout = QHBoxLayout()
-        drop_layout.addWidget(QLabel("Max Drop:"))
-        self.max_drop_spin = QDoubleSpinBox()
-        self.max_drop_spin.setRange(0.0, 1.0)
-        self.max_drop_spin.setSingleStep(0.01)
-        self.max_drop_spin.setValue(0.1)
-        self.max_drop_spin.setDecimals(3)
-        self.max_drop_spin.setToolTip("Detection threshold: maximum intensity drop between frames to accept a curve")
-        drop_layout.addWidget(self.max_drop_spin)
-        
-        drop_layout.addWidget(QLabel("Max Jump:"))
-        self.max_jump_spin = QDoubleSpinBox()
-        self.max_jump_spin.setRange(0.0, 1.0)
-        self.max_jump_spin.setSingleStep(0.01)
-        self.max_jump_spin.setValue(0.1)
-        self.max_jump_spin.setDecimals(3)
-        self.max_jump_spin.setToolTip("Detection threshold: maximum intensity jump between frames to accept a curve")
-        drop_layout.addWidget(self.max_jump_spin)
-        
-        drop_layout.addWidget(QLabel("Ignore First N:"))
-        self.ignore_first_n_spin = QSpinBox()
-        self.ignore_first_n_spin.setRange(0, 100)
-        self.ignore_first_n_spin.setValue(4)
-        self.ignore_first_n_spin.setToolTip("Frames to ignore in jump/drop analysis")
-        drop_layout.addWidget(self.ignore_first_n_spin)
-        drop_layout.addStretch()
-        filter_section.addLayout(drop_layout)
-        
-        # Value range
-        val_layout = QHBoxLayout()
-        val_layout.addWidget(QLabel("Min Value:"))
-        self.min_val_spin = QDoubleSpinBox()
-        self.min_val_spin.setRange(-10.0, 10.0)
-        self.min_val_spin.setSingleStep(0.1)
-        self.min_val_spin.setValue(0.1)
-        self.min_val_spin.setDecimals(3)
-        self.min_val_spin.setToolTip("Minimum allowed intensity value")
-        val_layout.addWidget(self.min_val_spin)
-        
-        val_layout.addWidget(QLabel("Max Value:"))
-        self.max_val_spin = QDoubleSpinBox()
-        self.max_val_spin.setRange(-10.0, 10.0)
-        self.max_val_spin.setSingleStep(0.1)
-        self.max_val_spin.setValue(1.2)
-        self.max_val_spin.setDecimals(3)
-        self.max_val_spin.setToolTip("Maximum allowed intensity value")
-        val_layout.addWidget(self.max_val_spin)
-        
-        self.no_filter_check = QCheckBox("Skip detection thresholds")
-        self.no_filter_check.setToolTip("Include all curves without applying detection thresholds")
-        val_layout.addWidget(self.no_filter_check)
-        val_layout.addStretch()
-        filter_section.addLayout(val_layout)
-        
-        layout.addWidget(filter_section)
         
         # ============ OUTPUT OPTIONS ============
         output_layout = QHBoxLayout()
@@ -3267,6 +3544,21 @@ class AnalysisTab(QWidget):
         # Run buttons
         run_layout = QHBoxLayout()
         
+        # Process number: single control driving all parallel workers (crop + fitting +
+        # D-grid). Last user input, next to the Run buttons.
+        run_layout.addWidget(QLabel("Process number:"))
+        self.process_number_spin = QSpinBox()
+        self.process_number_spin.setRange(1, 64)
+        self.process_number_spin.setValue(8)
+        self.process_number_spin.setToolTip(
+            "Number of parallel worker processes used across cropping and fitting.")
+        def _sync_process_number(v):
+            self.crop_n_jobs_spin.setValue(v)
+            self.n_jobs_conditions_spin.setValue(v)
+        self.process_number_spin.valueChanged.connect(_sync_process_number)
+        _sync_process_number(self.process_number_spin.value())
+        run_layout.addWidget(self.process_number_spin)
+
         self.crop_only_btn = QPushButton("Crop Only")
         self.crop_only_btn.clicked.connect(self.run_crop_only)
         self.crop_only_btn.setStyleSheet("""
@@ -3353,6 +3645,9 @@ class AnalysisTab(QWidget):
             'crop_multiplier': self.crop_multiplier_spin.value(),
             'min_nobleach_diameter': self.crop_min_nb_diam_spin.value(),
             'min_nobleach_pc': self.crop_min_nb_pc_spin.value(),
+            'min_bleach_depth': self.crop_min_bleach_depth_spin.value(),
+            'save_threshold_masks': self.save_threshold_qc_check.isChecked(),
+            'pixel_size': self.pixel_size_spin.value(),
             'n_jobs': self.crop_n_jobs_spin.value(),
             'stabilize': self.stabilize_check.isChecked(),
             'clear_borders': self.crop_clear_borders_check.isChecked(),
@@ -3408,6 +3703,12 @@ class AnalysisTab(QWidget):
     
     def _on_pde_fitting_changed(self, state):
         """Called when PDE fitting checkbox state changes. Updates filtering tab dropdowns."""
+        # The mixed model needs a PDE fit; disable (and visually clear) it when PDE is off.
+        if hasattr(self, 'mixed_model_check'):
+            pde_on = self.pde_fitting_check.isChecked()
+            self.mixed_model_check.setEnabled(pde_on)
+            if not pde_on:
+                self.mixed_model_check.setChecked(False)
         # Notify the filtering tab to update its parameter combos
         if self.main_window and hasattr(self.main_window, 'filtering_tab'):
             filtering_tab = self.main_window.filtering_tab
@@ -3545,6 +3846,8 @@ class AnalysisTab(QWidget):
                 'pixel_size': pixel_size,
                 'frame_interval': frame_interval,
                 'pre_bleach_frames': self.pre_bleach_frames_spin.value(),
+                'analysis_channel': self.analysis_channel_combo.currentIndex() + 1,
+                'two_channel': self.two_channel_check.isChecked(),
                 'save_frap_fit_separate': self.save_frap_fit_check.isChecked(),
                 'save_k_exp_scatters': self.save_k_exp_scatters_check.isChecked(),
                 'save_noise_pixels': self.save_noise_pixels_check.isChecked(),
@@ -3578,7 +3881,12 @@ class AnalysisTab(QWidget):
                 'pb_ratio_tolerance': 0.05,
                 'no_photobleach_correct': self.no_photobleach_check.isChecked(),
                 'no_exp_plateau_fit': self.no_exp_plateau_check.isChecked(),
-                'no_combined_model': not self.pde_fitting_check.isChecked(),  # Inverted: PDE enabled = combined model on
+                # PDE fitting on/off drives whether the D grid search runs at all.
+                'pde_fitting_enabled': self.pde_fitting_check.isChecked(),
+                # Mixed model is independent, but only when PDE is enabled AND selected.
+                'no_combined_model': not (
+                    self.pde_fitting_check.isChecked() and self.mixed_model_check.isChecked()
+                ),
                 'verbosity': 1,
                 # Stabilization parameters
                 'stabilize_enabled': self.stabilize_check.isChecked(),
@@ -3601,7 +3909,16 @@ class AnalysisTab(QWidget):
                 'crop_crop_multiplier': self.crop_multiplier_spin.value(),
                 'crop_min_nobleach_diameter': self.crop_min_nb_diam_spin.value(),
                 'crop_min_nobleach_pc': self.crop_min_nb_pc_spin.value(),
+                'crop_bleach_spot_min_area': self.crop_bleach_spot_min_area_spin.value(),
+                'crop_min_bleach_depth': self.crop_min_bleach_depth_spin.value(),
+                'bleach_depth': self.crop_min_bleach_depth_spin.value(),
+                'save_threshold_masks': self.save_threshold_qc_check.isChecked(),
                 'crop_n_jobs': self.crop_n_jobs_spin.value(),
+                # Variable timing + frame-range stabilization
+                'timing_segments': self.timing_segments_edit.text().strip(),
+                'stabilize_frame_start': self.stab_frame_start_spin.value(),
+                'stabilize_frame_end': self.stab_frame_end_spin.value(),
+                'stabilize_extrapolation': self.stab_extrapolation_combo.currentText(),
                 # Flag to indicate raw movies need full processing
                 'has_raw_movies': has_raw_movies,
                 'raw_movie_files': raw_movie_files if has_raw_movies else [],
@@ -3692,6 +4009,7 @@ class AnalysisTab(QWidget):
                 'no_photobleach_correct': self.no_photobleach_check.isChecked(),
                 'no_exp_plateau_fit': self.no_exp_plateau_check.isChecked(),
                 'pde_fitting_enabled': self.pde_fitting_check.isChecked(),
+                'mixed_model_enabled': self.mixed_model_check.isChecked(),
                 'n_jobs_conditions': self.n_jobs_conditions_spin.value(),
             },
             'arithmetic_filter_parameters': {
@@ -3774,6 +4092,7 @@ class AnalysisTab(QWidget):
                 'no_photobleach_correct': self.no_photobleach_check.isChecked(),
                 'no_exp_plateau_fit': self.no_exp_plateau_check.isChecked(),
                 'pde_fitting_enabled': self.pde_fitting_check.isChecked(),
+                'mixed_model_enabled': self.mixed_model_check.isChecked(),
                 'n_jobs_conditions': self.n_jobs_conditions_spin.value(),
             },
             'filter_parameters': {
@@ -3865,7 +4184,7 @@ class AnalysisTab(QWidget):
                     self.d_refine_grid_spin.setValue(pp.get('d_refine_grid_size', 100))
                     self.droplet_min_size_spin.setValue(pp.get('droplet_min_size', 50))
                     self.ratio_percentile_spin.setValue(pp.get('ratio_percentile', 85.0))
-                    self.max_frames_spin.setValue(pp.get('max_frames', 30))
+                    self.max_frames_spin.setValue(pp.get('max_frames', -1))
                     self.downsample_spin.setValue(pp.get('downsample_factor', 2))
                     self.pde_first_frame_spin.setValue(pp.get('pde_first_frame', 1))
                     self.pde_last_frame_spin.setValue(pp.get('pde_last_frame', 7))
@@ -3878,7 +4197,16 @@ class AnalysisTab(QWidget):
                         self.pde_fitting_check.setChecked(pp.get('pde_fitting_enabled', True))
                     elif 'no_combined_model' in pp:
                         self.pde_fitting_check.setChecked(not pp.get('no_combined_model', False))
+                    # Mixed model: prefer explicit new flag; fall back to legacy no_combined_model.
+                    if 'mixed_model_enabled' in pp:
+                        self.mixed_model_check.setChecked(pp.get('mixed_model_enabled', False))
+                    elif 'no_combined_model' in pp:
+                        self.mixed_model_check.setChecked(not pp.get('no_combined_model', False))
+                    # Keep the mixed-model checkbox enabled state in sync with PDE.
+                    self._on_pde_fitting_changed(None)
                     self.n_jobs_conditions_spin.setValue(pp.get('n_jobs_conditions', 8))
+                    if hasattr(self, 'process_number_spin'):
+                        self.process_number_spin.setValue(pp.get('n_jobs_conditions', 8))
                 
                 # Restore filter parameters (also check legacy format)
                 if 'filter_parameters' in config:
@@ -4142,48 +4470,105 @@ class VisualizationTab(QWidget):
         return False
     
     def refresh_movie_list(self):
-        """Scan directory for all_frap_curves.csv files and populate combo."""
+        """Scan the Analysis Results directory for the curve CSVs written by the
+        Analysis-run tab and populate the movie selector.
+
+        Prefers the new per-normalization stacked CSVs (``Pre-bleach_stacked_all.csv`` /
+        ``Whole-droplet_stacked_all.csv``), both the filtered main files and the raw
+        ``*_unfiltered.csv`` copies, per movie folder and at the results root. Falls back
+        to the legacy ``all_frap_curves.csv`` if that's all that's present.
+        """
         self.movie_combo.clear()
-        
+
         dir_path = self.dir_label.text()
         if not dir_path or dir_path == "Not selected" or not os.path.isdir(dir_path):
             return
-        
-        # Find all_frap_curves.csv files
-        csv_files = []
+
+        # Recognized curve-file base names -> friendly normalization label.
+        stacked_labels = {
+            "Pre-bleach_stacked_all.csv": "Pre-bleach",
+            "Whole-droplet_stacked_all.csv": "Whole-droplet",
+            "Pre-bleach_stacked_all_unfiltered.csv": "Pre-bleach (unfiltered)",
+            "Whole-droplet_stacked_all_unfiltered.csv": "Whole-droplet (unfiltered)",
+        }
+
+        entries = []  # (label, path)
+        dir_abs = os.path.abspath(dir_path)
         for root, dirs, files in os.walk(dir_path):
-            for file in files:
-                if file == "all_frap_curves.csv":
-                    rel_path = os.path.relpath(os.path.join(root, file), dir_path)
-                    # Use parent folder name as movie identifier
-                    movie_name = os.path.basename(root)
-                    csv_files.append((movie_name, os.path.join(root, file)))
-        
-        if not csv_files:
-            self.status_label.setText("No all_frap_curves.csv files found in directory.")
+            is_root = os.path.abspath(root) == dir_abs
+            # Movie name from the *_results folder (root aggregates all movies).
+            folder = os.path.basename(root)
+            movie_name = folder[:-8] if folder.endswith("_results") else folder
+            for fname, norm in stacked_labels.items():
+                if fname in files:
+                    scope = "All movies (combined)" if is_root else movie_name
+                    entries.append((f"{scope}  —  {norm}",
+                                    os.path.join(root, fname)))
+            # Legacy fallback.
+            if "all_frap_curves.csv" in files:
+                scope = "All movies (combined)" if is_root else movie_name
+                entries.append((f"{scope}  —  legacy curves",
+                                os.path.join(root, "all_frap_curves.csv")))
+
+        if not entries:
+            self.status_label.setText(
+                "No FRAP curve CSVs found. Run the Analysis tab first (looks for "
+                "*_stacked_all.csv / all_frap_curves.csv).")
             return
-        
-        # Sort by movie name
-        csv_files.sort(key=lambda x: x[0])
-        
-        for movie_name, csv_path in csv_files:
-            self.movie_combo.addItem(movie_name, csv_path)
-        
-        self.status_label.setText(f"Found {len(csv_files)} movies with FRAP curves.")
-    
+
+        # Combined-root entries first, then per-movie, alphabetical; filtered before raw.
+        entries.sort(key=lambda e: (not e[0].startswith("All movies"),
+                                    "unfiltered" in e[0], e[0]))
+        for label, path in entries:
+            self.movie_combo.addItem(label, path)
+
+        self.status_label.setText(f"Found {len(entries)} curve set(s).")
+
+    @staticmethod
+    def _load_curves_dataframe(csv_path):
+        """Load any of the supported curve CSVs into a frames-x-curves DataFrame
+        (columns are individual curves, one row per frame)."""
+        df = pd.read_csv(csv_path)
+        cols_lower = [str(c).lower() for c in df.columns]
+
+        # New transposed stacked format: a 'bleach_point' column + frame_N columns.
+        if "bleach_point" in cols_lower:
+            bp_col = df.columns[cols_lower.index("bleach_point")]
+            frame_cols = [c for c in df.columns if str(c).lower().startswith("frame")]
+            wide = df.set_index(bp_col)[frame_cols].T
+            wide.index = range(len(wide))  # frame index
+            return wide
+
+        # Long format: FRAP_droplet_timeseries.csv (droplet + FRAP_norm_* columns).
+        if "droplet" in cols_lower:
+            drop_col = df.columns[cols_lower.index("droplet")]
+            norm_col = None
+            for cand in ("FRAP_norm_prebleach", "FRAP_norm_wholedroplet", "FRAP_fit_ROI"):
+                if cand in df.columns:
+                    norm_col = cand
+                    break
+            if norm_col is not None:
+                pivoted = df.pivot_table(index=df.groupby(drop_col).cumcount(),
+                                         columns=drop_col, values=norm_col)
+                return pivoted
+
+        # Legacy all_frap_curves.csv: columns already curves (maybe a leading frame col).
+        return df
+
     def load_selected_movie(self, movie_name):
-        """Load the selected movie's all_frap_curves.csv."""
+        """Load the selected curve set into the plot."""
         if not movie_name:
             return
-        
+
         csv_path = self.movie_combo.currentData()
         if not csv_path or not os.path.exists(csv_path):
             return
-        
+
         try:
-            self.current_data = pd.read_csv(csv_path)
+            self.current_data = self._load_curves_dataframe(csv_path)
             self.current_csv_path = csv_path
-            self.status_label.setText(f"Loaded {movie_name}: {len(self.current_data.columns) - 1} curves")
+            n_curves = self.current_data.shape[1]
+            self.status_label.setText(f"Loaded {movie_name}: {n_curves} curves")
             self.update_plot()
         except Exception as e:
             self.status_label.setText(f"Error loading {movie_name}: {str(e)}")
@@ -4198,10 +4583,11 @@ class VisualizationTab(QWidget):
         
         df = self.current_data.copy()
         
-        # Check if first column is frame index
-        if 'frame' in df.columns[0].lower() or df.columns[0] == 'Unnamed: 0':
-            frame_col = df.columns[0]
-            df = df.set_index(frame_col)
+        # Check if first column is a frame index (only for legacy/wide inputs that carry
+        # one). The stacked/long loaders already return a clean frames-x-curves frame.
+        first_col = str(df.columns[0]).lower()
+        if 'frame' in first_col or 'time' in first_col or df.columns[0] == 'Unnamed: 0':
+            df = df.set_index(df.columns[0])
         
         # Get filter parameters
         apply_filter = self.show_filtered_check.isChecked()
@@ -4239,7 +4625,7 @@ class VisualizationTab(QWidget):
                     filtered_curves += 1
                     color = colors[i % len(colors)]
                     pen = pg.mkPen(color=color, width=1.5)
-                    self.plot_widget.plot(x_vals, y_vals, pen=pen, name=col[:20])
+                    self.plot_widget.plot(x_vals, y_vals, pen=pen, name=str(col)[:20])
                     
             except (ValueError, TypeError):
                 continue
@@ -4260,7 +4646,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("BleachDt: FRAP Analysis")
         self.setGeometry(100, 100, 1200, 800)
-        
+
+        # Window/title-bar icon (matches the app/dock icon).
+        _win_icon = app_icon()
+        if not _win_icon.isNull():
+            self.setWindowIcon(_win_icon)
+
         # Apply modern styling
         self.setStyleSheet("""
             QMainWindow {
@@ -4354,7 +4745,26 @@ class MainWindow(QMainWindow):
         
         layout = QVBoxLayout()
         central_widget.setLayout(layout)
-        
+
+        # Branding header: wordmark (logo + package name), falling back to styled text.
+        header = QHBoxLayout()
+        header.setContentsMargins(4, 2, 4, 2)
+        wm = wordmark_pixmap(height=34)
+        brand_label = QLabel()
+        if wm is not None and not wm.isNull():
+            brand_label.setPixmap(wm)
+        else:
+            # Fallback: an icon glyph next to a text wordmark.
+            _ic = app_icon()
+            if not _ic.isNull():
+                brand_label.setPixmap(_ic.pixmap(28, 28))
+            text_label = QLabel("bleachDτ")
+            text_label.setStyleSheet("font-size: 20px; font-weight: 600; color: #1a1a1a;")
+            header.addWidget(text_label)
+        header.addWidget(brand_label)
+        header.addStretch()
+        layout.addLayout(header)
+
         # Create tab widget
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("""
@@ -4389,13 +4799,43 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.analysis_tab, "Analysis")
         self.tabs.addTab(self.filtering_tab, "Filtering")
         self.tabs.addTab(self.visualization_tab, "Visualization")
-        
+
         layout.addWidget(self.tabs)
+
+        # Ensure no numeric field is capped below the range the user needs. Some spinboxes
+        # were built with low maxima (e.g. PDE/exp frame fields at 100), which blocked
+        # legitimate values like a 300-frame fit window. Sweep every spinbox in the app and
+        # raise its maximum: integer fields (frame indices, counts, iterations) to a very
+        # large value; float fields to at least 999. Minimums and current values are left
+        # untouched.
+        self._raise_spinbox_limits()
+
+    def _raise_spinbox_limits(self, int_max: int = 1_000_000, float_min_max: float = 999.0):
+        """Raise the maximum of every spin box so numeric entry is never blocked below the
+        needed range (see call site). Never lowers an already-higher maximum."""
+        try:
+            for sb in self.findChildren(QSpinBox):
+                if sb.maximum() < int_max:
+                    sb.setMaximum(int_max)
+            for sb in self.findChildren(QDoubleSpinBox):
+                if sb.maximum() < float_min_max:
+                    sb.setMaximum(float_min_max)
+        except Exception:
+            pass
 
 
 def main():
     app = QApplication(sys.argv)
-    
+
+    # Branding: application name + icon. Setting the QApplication icon makes it the
+    # taskbar/dock icon at runtime across platforms. (For a fully standalone macOS .app
+    # bundle, also point CFBundleIconFile at assets/icon.icns in the bundle's Info.plist.)
+    app.setApplicationName("BleachDt")
+    app.setApplicationDisplayName("BleachDt")
+    _icon = app_icon()
+    if not _icon.isNull():
+        app.setWindowIcon(_icon)
+
     # Set application style
     app.setStyle('Fusion')
     # Force a light palette so the UI stays readable in macOS dark mode

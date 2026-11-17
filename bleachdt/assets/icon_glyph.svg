@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 100 100" role="img" aria-label="BiP condensate FRAP droplet">
+  <title>BiP FRAP glyph</title>
+  <defs>
+    <radialGradient id="gbody" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%"  stop-color="#5BFF3A"/>
+      <stop offset="34%" stop-color="#43EE2C"/>
+      <stop offset="60%" stop-color="#31C022"/>
+      <stop offset="82%" stop-color="#1E8C18"/>
+      <stop offset="100%" stop-color="#0C5A10"/>
+    </radialGradient>
+    <radialGradient id="gspec" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%"  stop-color="#E9FFDF" stop-opacity="0.85"/>
+      <stop offset="45%" stop-color="#B6FF9E" stop-opacity="0.30"/>
+      <stop offset="100%" stop-color="#B6FF9E" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gbleach" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%"  stop-color="#03170A"/>
+      <stop offset="42%" stop-color="#062512"/>
+      <stop offset="72%" stop-color="#0E5A1C" stop-opacity="0.92"/>
+      <stop offset="90%" stop-color="#1E8C18" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#31C022" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="50" cy="50" r="46" fill="url(#gbody)"/>
+  <circle cx="50" cy="50" r="46" fill="none" stroke="#1EFF00" stroke-opacity="0.9" stroke-width="1.9"/>
+  <circle cx="50" cy="50" r="15.7" fill="url(#gbleach)"/>
+  <circle cx="50" cy="50" r="15.7" fill="none" stroke="#03170A" stroke-opacity="0.55" stroke-width="1.0"/>
+  <ellipse cx="38" cy="36" rx="19" ry="14" fill="url(#gspec)"/>
+</svg>

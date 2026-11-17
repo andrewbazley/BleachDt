@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bleachdt"
-version = "4.1.1"
+version = "4.3.0"
 description = "BleachDt - A comprehensive toolkit for analyzing FRAP experiments in phase-separated droplets"
 readme = "README.md"
 license = {text = "MIT"}
@@ -119,6 +119,10 @@ bleachdt = "bleachdt.gui:main"
 
 [tool.setuptools]
 packages = ["bleachdt"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+bleachdt = ["assets/*.png", "assets/*.svg", "assets/*.ico", "assets/*.icns"]
 
 [tool.black]
 line-length = 100
