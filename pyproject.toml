@@ -105,6 +105,7 @@ Homepage = "https://github.com/andrewbazley/BleachDt"
 Documentation = "https://github.com/andrewbazley/BleachDt#readme"
 Repository = "https://github.com/andrewbazley/BleachDt.git"
 Issues = "https://github.com/andrewbazley/BleachDt/issues"
+Changelog = "https://github.com/andrewbazley/BleachDt/blob/main/CHANGELOG.md"
 
 [project.scripts]
 bleachdt-gui = "bleachdt.gui:main"

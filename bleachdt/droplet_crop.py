@@ -360,7 +360,7 @@ def _read_stack_array(path: Path, verbose: bool = True) -> np.ndarray:
                             f"{'='*60}\n"
                             f"File: {path.name}\n\n"
                             f"Both nd2 and aicsimageio failed to read this file.\n"
-                            f"nd2 error: {str(e) if 'e' in dir() else 'not installed'}\n"
+                            f"nd2 error: {nd2_error or 'not installed'}\n"
                             f"aicsimageio error: {str(e2)}\n\n"
                             f"This may be a corrupted or unsupported ND2 variant.\n"
                             f"Try opening in Fiji and re-saving as TIFF.\n"
@@ -516,7 +516,7 @@ def parse_timing_segments(spec: str, n_frames: int = None):
     by its segment's interval. If ``n_frames`` is given, the result is truncated or the
     last interval is extended to cover any extra frames. Returns None on a bad spec.
     """
-    if not spec:
+    if not spec or not str(spec).strip():
         return None
     import re
     segments = []
@@ -524,11 +524,14 @@ def parse_timing_segments(spec: str, n_frames: int = None):
         part = part.strip()
         if not part:
             continue
-        m = re.match(r"^\s*(\d+)\s*[x@*]\s*([0-9]*\.?[0-9]+)\s*$", part)
-        if not m:
+        m = re.match(r"^(\d+)\s*[xX@*]\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)$", part)
+        if not m or not np.isfinite(float(m.group(2))) or float(m.group(2)) < 0:
+            print(f"  Warning: could not parse timing segment '{part}' in '{spec}' "
+                  f"(expected COUNTxINTERVAL, e.g. 300x0.1); ignoring --timing-segments.")
             return None
         segments.append((int(m.group(1)), float(m.group(2))))
-    if not segments:
+    if not segments or sum(c for c, _ in segments) == 0:
+        print(f"  Warning: timing spec '{spec}' describes no frames; ignoring --timing-segments.")
         return None
     times = []
     first = True
@@ -550,13 +553,47 @@ def parse_timing_segments(spec: str, n_frames: int = None):
     return times
 
 
-def read_frame_times_from_metadata(path: Path, n_frames: int = None, verbose: bool = False):
-    """Best-effort read of per-frame acquisition timestamps (seconds, first frame = 0).
+_TIME_UNIT_SECONDS = {
+    "ns": 1e-9, "µs": 1e-6, "us": 1e-6, "ms": 1e-3, "msec": 1e-3,
+    "s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0,
+    "min": 60.0, "minute": 60.0, "minutes": 60.0,
+    "h": 3600.0, "hr": 3600.0, "hour": 3600.0, "hours": 3600.0,
+}
 
-    Supports Nikon ND2 (via the ``nd2`` package, per-frame ``T`` timestamps) and
-    OME-TIFF / ImageJ TIFFs (via ``tifffile``: OME ``Plane DeltaT`` or the ImageJ
-    ``finterval``/``Info`` tags). Returns a float array or None if timing can't be read.
-    Never raises.
+
+def _time_unit_scale(unit) -> "float | None":
+    if unit is None or str(unit).strip() == "":
+        return 1.0
+    return _TIME_UNIT_SECONDS.get(str(unit).strip().lower())
+
+
+def _ome_plane_times(ome_xml: str):
+    """Per-timepoint DeltaT (seconds) from OME-XML, using only planes with TheC=0, TheZ=0."""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(ome_xml)
+    pixels = next((el for el in root.iter() if el.tag.endswith("Pixels")), None)
+    if pixels is None:
+        return None
+    by_t = {}
+    for plane in pixels:
+        if not plane.tag.endswith("Plane") or plane.get("DeltaT") is None:
+            continue
+        if int(plane.get("TheC", 0)) != 0 or int(plane.get("TheZ", 0)) != 0:
+            continue
+        scale = _time_unit_scale(plane.get("DeltaTUnit"))
+        if scale is None:
+            return None
+        by_t[int(plane.get("TheT", 0))] = float(plane.get("DeltaT")) * scale
+    if len(by_t) < 2:
+        return None
+    return np.asarray([by_t[t] for t in sorted(by_t)], dtype=np.float64)
+
+
+def _read_frame_times_with_source(path: Path, n_frames: int = None, verbose: bool = False):
+    """Return ``(times, source)`` from acquisition metadata, or ``(None, None)``.
+
+    ``source`` is ``metadata_nd2`` / ``metadata_ome`` (per-frame timestamps) or
+    ``metadata_imagej`` (a single constant ``finterval``). Never raises.
     """
     p = Path(path)
     ext = p.suffix.lower()
@@ -567,7 +604,7 @@ def read_frame_times_from_metadata(path: Path, n_frames: int = None, verbose: bo
             except Exception:
                 if verbose:
                     print("  (ND2 timing: 'nd2' package not installed; skipping metadata.)")
-                return None
+                return None, None
             try:
                 with nd2.ND2File(str(p)) as f:
                     # Per-frame experiment time in ms is exposed on the frame metadata.
@@ -583,45 +620,66 @@ def read_frame_times_from_metadata(path: Path, n_frames: int = None, verbose: bo
                             break
                     if tv:
                         tv = np.asarray(tv, dtype=np.float64)
-                        return tv - tv[0]
+                        return tv - tv[0], "metadata_nd2"
             except Exception:
-                return None
-            return None
+                return None, None
+            return None, None
         elif ext in (".tif", ".tiff"):
             import tifffile
             with tifffile.TiffFile(str(p)) as tf:
-                # OME-TIFF: per-plane DeltaT.
                 ome = getattr(tf, "ome_metadata", None)
                 if ome:
-                    import re
-                    dts = re.findall(r'DeltaT="([0-9eE+\-.]+)"', ome)
-                    if len(dts) >= 2:
-                        tv = np.asarray([float(x) for x in dts], dtype=np.float64)
-                        return tv - tv[0]
-                # ImageJ: constant finterval (seconds) or per-frame in 'Info'.
+                    tv = _ome_plane_times(ome)
+                    if tv is not None:
+                        return tv - tv[0], "metadata_ome"
+                # ImageJ stores a single constant finterval in units of `tunit`.
                 ij = getattr(tf, "imagej_metadata", None)
-                if ij:
-                    if "finterval" in ij and n_frames:
-                        dt = float(ij["finterval"])
-                        if dt > 0:
-                            return np.arange(n_frames, dtype=np.float64) * dt
-        return None
+                if ij and "finterval" in ij and n_frames:
+                    scale = _time_unit_scale(ij.get("tunit") or ij.get("unit_t"))
+                    dt = float(ij["finterval"]) * (scale or 0.0)
+                    if dt > 0:
+                        return np.arange(n_frames, dtype=np.float64) * dt, "metadata_imagej"
+        return None, None
     except Exception:
-        return None
+        return None, None
+
+
+def read_frame_times_from_metadata(path: Path, n_frames: int = None, verbose: bool = False):
+    """Best-effort read of per-frame acquisition timestamps (seconds, first frame = 0).
+
+    Supports Nikon ND2 (via the ``nd2`` package, per-frame ``T`` timestamps) and
+    OME-TIFF / ImageJ TIFFs (via ``tifffile``: OME ``Plane DeltaT`` or the ImageJ
+    ``finterval`` tag). Returns a float array or None if timing can't be read.
+    Never raises.
+    """
+    return _read_frame_times_with_source(path, n_frames=n_frames, verbose=verbose)[0]
 
 
 def resolve_frame_times(path: Path, n_frames: int, frame_interval: float,
                         timing_segments: str = "", verbose: bool = False):
     """Resolve a per-frame time axis (seconds) using the agreed precedence:
-    (1) acquisition metadata, (2) an explicit multi-segment spec, (3) constant
-    ``frame_interval``. Returns ``(times, source)``."""
-    tv = read_frame_times_from_metadata(path, n_frames=n_frames, verbose=verbose)
-    if tv is not None and len(tv) >= n_frames:
-        return np.asarray(tv[:n_frames], dtype=np.float64), "metadata"
-    if timing_segments:
-        seg = parse_timing_segments(timing_segments, n_frames=n_frames)
-        if seg is not None and len(seg) >= n_frames:
-            return np.asarray(seg[:n_frames], dtype=np.float64), "segments"
+    (1) per-frame acquisition timestamps (ND2 / OME), (2) an explicit multi-segment
+    spec, (3) a constant ImageJ ``finterval``, (4) constant ``frame_interval``.
+    Returns ``(times, source)``.
+
+    Segments outrank ImageJ's ``finterval`` because Fiji writes a single average
+    interval when it converts a variable-cadence acquisition.
+    """
+    tv, src = _read_frame_times_with_source(path, n_frames=n_frames, verbose=verbose)
+    if tv is not None and len(tv) < n_frames:
+        tv, src = None, None
+    seg = parse_timing_segments(timing_segments, n_frames=n_frames) if timing_segments else None
+    if seg is not None and len(seg) < n_frames:
+        seg = None
+    if tv is not None and src != "metadata_imagej":
+        return np.asarray(tv[:n_frames], dtype=np.float64), src
+    if seg is not None:
+        if tv is not None:
+            print(f"  Note: --timing-segments overrides the constant ImageJ frame interval "
+                  f"in {Path(path).name}.")
+        return np.asarray(seg[:n_frames], dtype=np.float64), "segments"
+    if tv is not None:
+        return np.asarray(tv[:n_frames], dtype=np.float64), src
     return np.arange(n_frames, dtype=np.float64) * float(frame_interval), "constant_interval"
 
 
@@ -883,6 +941,10 @@ def classify_droplets_by_bleach_spots(
     Returns ``(classes, spot_labels, overlap_frac, bleach_depth)`` where ``bleach_depth``
     maps a FRAP droplet label -> its measured fractional bleach depth (QC).
     """
+    # A dead or hot pixel gives a ratio in the millions; blurred, it would cover enough of
+    # the field to drag the adaptive cutoff above every real spot. A ratio of 10 is already
+    # a 90% bleach, so capping there leaves real spots untouched.
+    ratio_image = np.clip(ratio_image, 0.0, 10.0)
     ratio_smooth = filters.gaussian(ratio_image, sigma=ratio_blur_sigma) if ratio_blur_sigma > 0 else ratio_image
 
     # Effective spot cutoff: adaptive IsoData (auto valley) with the fixed value as a floor,
@@ -1738,8 +1800,10 @@ def _resolve_stab_range(T: int, start: int, end: int) -> "tuple[int, int, bool]"
     the original behavior)."""
     s = max(0, int(start))
     e = (T - 1) if (end is None or int(end) < 0) else min(int(end), T - 1)
-    if e < s:
-        e = T - 1
+    if s >= T or e < s:
+        print(f"  Warning: stabilization frame range [{start}, {end}] is empty for a "
+              f"{T}-frame movie; stabilizing over the full stack instead.")
+        return 0, T - 1, True
     is_full = (s <= 0 and e >= T - 1)
     return s, e, is_full
 
@@ -1763,8 +1827,10 @@ def _expand_range_shifts(idxs, sub_shifts, sub_resids, T, extrapolation="hold"):
     for k in range(2):
         fp = sub_shifts[:, k]
         if extrapolation == "poly" and len(idxs) >= 3:
+            # No intercept term, so the drift model passes through frame 0 exactly.
             deg = min(2, len(idxs) - 1)
-            full[:, k] = np.polyval(np.polyfit(idxs, fp, deg), xs)
+            coef = np.linalg.lstsq(np.vander(idxs, deg + 1)[:, :-1], fp, rcond=None)[0]
+            full[:, k] = np.vander(xs, deg + 1)[:, :-1] @ coef
             continue
         vals = np.interp(xs, idxs, fp)  # linear between samples, flat ('hold') outside
         if extrapolation == "linear" and len(idxs) >= 2:
@@ -1870,22 +1936,27 @@ def process_stack_file(
     # Resolve the per-frame time axis (metadata -> segments -> constant interval) and write
     # a *_frame_times.csv sidecar into the movie results folder. The analysis stage reads
     # this so a variable acquisition cadence (e.g. a 100 ms burst then 10 s sampling) flows
-    # correctly into the reported time_s column and the time-aware fits.
+    # correctly into the reported time_s column and the time-aware fits. A plain constant
+    # interval gets no sidecar, so the analysis stage uses its own --frame-interval.
     try:
         frame_times, time_src = resolve_frame_times(
             input_path, T, frame_interval, timing_segments=timing_segments, verbose=verbose)
         results_dir = movie_out_dir.parent
-        results_dir.mkdir(parents=True, exist_ok=True)
-        import csv as _csv_t
         ft_path = results_dir / f"{input_path.stem}_frame_times.csv"
-        with open(ft_path, "w", newline="") as f_ft:
-            wt = _csv_t.writer(f_ft)
-            wt.writerow(["frame", "time_s"])
-            for i in range(T):
-                wt.writerow([i, f"{float(frame_times[i]):.6f}"])
-        if verbose:
-            print(f"  Wrote frame time axis ({time_src}): {ft_path.name} "
-                  f"(t0={frame_times[0]:.3f}s .. t{T-1}={frame_times[-1]:.3f}s)")
+        if time_src == "constant_interval":
+            if ft_path.exists():
+                ft_path.unlink()  # stale sidecar from an earlier run
+        else:
+            results_dir.mkdir(parents=True, exist_ok=True)
+            import csv as _csv_t
+            with open(ft_path, "w", newline="") as f_ft:
+                wt = _csv_t.writer(f_ft)
+                wt.writerow(["frame", "time_s", "source"])
+                for i in range(T):
+                    wt.writerow([i, f"{float(frame_times[i]):.6f}", time_src])
+            if verbose:
+                print(f"  Wrote frame time axis ({time_src}): {ft_path.name} "
+                      f"(t0={frame_times[0]:.3f}s .. t{T-1}={frame_times[-1]:.3f}s)")
     except Exception as e:
         if verbose:
             print(f"  (Could not write frame-times sidecar: {e})")

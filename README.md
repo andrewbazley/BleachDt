@@ -40,7 +40,7 @@ Support for long movies with a mixed acquisition cadence (e.g. a continuous 100 
 - **Spot-based bleach-point detection.** A bleach point is found by thresholding the pre/post ratio image (mean of the pre-bleach frames ÷ first post-bleach frame) into localized **bleach spots**; any droplet a spot overlaps is FRAP, everything else is NoBleach. This calls large droplets correctly, where a whole-droplet mean would dilute the small bleach spot to background. Controlled by `--bleach-threshold` and `--bleach-spot-min-area`.
 - **Averaged pre-bleach frames.** Detection, partition coefficient, and the ratio use the **mean of the pre-bleach frames** (not just the last one).
 - **Range stabilization aligned to the first frame.** Estimate drift on frame 0 plus a chosen `[start, end]` window (`--stabilize-frame-start/-end`), then apply a continuous, whole-stack trajectory referenced to frame 0 — no discontinuity where the window ends (`--stabilize-extrapolation hold|linear|poly`). Efficient when drift is concentrated in a sparse tail.
-- **Variable per-frame timing.** Acquisition timestamps are read from the movie metadata (Nikon ND2 or OME/ImageJ TIFF) when present; otherwise a `--timing-segments "300x0.1,35x10"` spec (300 frames at 0.1 s, then 35 at 10 s) or the constant `--frame-interval` is used. The resolved axis is written to a `[movie]_frame_times.csv` sidecar and consumed by the **time-aware fits**: the exponential/PDE fits and half-time run on true seconds, so a dense early burst contributes many closely-spaced points and the sparse tail few — with no change to uniform-interval movies.
+- **Variable per-frame timing.** Per-frame acquisition timestamps are read from the movie metadata (Nikon ND2, or OME-TIFF `DeltaT`) when present; otherwise a `--timing-segments "300x0.1,35x10"` spec (300 frames at 0.1 s, then 35 at 10 s) is used, then an ImageJ TIFF's constant frame interval, then the constant `--frame-interval`. (Segments outrank ImageJ's interval because Fiji writes a single average interval when it converts a variable-cadence movie.) Real timestamps or segments are written to a `[movie]_frame_times.csv` sidecar and consumed by the **time-aware fits** — the exponential, PDE and mixed-model fits and half-time run on true seconds, so a dense early burst contributes many closely-spaced points and the sparse tail few. Constant-interval movies get no sidecar and behave exactly as before.
 
 ---
 
@@ -92,7 +92,7 @@ pip install -e .[all]
 
 ### Requirements
 
-- **Python**: 3.7 or higher
+- **Python**: 3.9 or higher
 - **Platforms**: Windows, macOS, Linux
 - **Core Dependencies**: numpy, pandas, matplotlib, scipy, scikit-image, tifffile, numba, opencv-python
 - **GUI Dependencies**: pyqtgraph + PySide6 (or PyQt6/PyQt5)

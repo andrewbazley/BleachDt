@@ -1,5 +1,6 @@
 # Documentation and metadata
 include README.md
+include CHANGELOG.md
 include LICENSE
 include requirements.txt
 include pyproject.toml

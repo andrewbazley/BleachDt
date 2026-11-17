@@ -19,6 +19,7 @@ Defaults assume: 0.11 µm/pixel, 10 s frame interval.
 from __future__ import annotations
 
 import os
+import re
 import glob
 import argparse
 import logging
@@ -994,6 +995,20 @@ def fit_single_exp_plateau(times, intensities, constrain_Y0=None):
 # Combined model helpers (PDE + constrained exponential tail)
 # ------------------------------------------------------------
 
+def _frame_times_at(frame_ids, frame_interval, frame_times=None, origin=None):
+    """Time (s, float32) of each frame in ``frame_ids``, relative to frame ``origin``
+    when given. Uses the per-frame ``frame_times`` axis (variable cadence) if provided,
+    else the uniform ``frame_interval`` grid."""
+    ids = np.asarray(frame_ids, dtype=int)
+    if frame_times is None:
+        if origin is None:
+            return ids.astype(np.float32) * frame_interval
+        return (ids - origin).astype(np.float32) * frame_interval
+    ft = np.asarray(frame_times, dtype=np.float64)
+    t = ft[ids] if origin is None else ft[ids] - ft[origin]
+    return t.astype(np.float32)
+
+
 def compute_pde_mean_curve(
     D,
     c0,
@@ -1003,18 +1018,20 @@ def compute_pde_mean_curve(
     frame_interval,
     dt_sim,
     dx,
+    frame_times=None,
 ):
     """
     Return (t_plot, mean_intensity) where t_plot is aligned with the data axis.
 
     - PDE time axis starts at t_rel = 0 at the first PDE frame in `frame_ids`.
-    - We simulate at times_rel = (frame_ids - frame_ids[0]) * frame_interval.
-    - We return t_plot = frame_ids * frame_interval (so frame 1 is at Δt, etc.).
+    - We simulate at times_rel = t(frame_ids) - t(frame_ids[0]).
+    - We return t_plot = t(frame_ids) (so frame 1 is at Δt, etc.).
+    Times come from ``frame_times`` when given, else ``frame_ids * frame_interval``.
     """
     if frame_ids.size == 0:
         return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
 
-    times_rel = (frame_ids - frame_ids[0]).astype(np.float32) * frame_interval
+    times_rel = _frame_times_at(frame_ids, frame_interval, frame_times, origin=frame_ids[0])
     snaps = simulate_diffusion_jit(
         D,
         c0.astype(np.float32),
@@ -1028,7 +1045,7 @@ def compute_pde_mean_curve(
         vals = snaps[k][fit_mask]
         pred_curve[k] = vals.mean() if vals.size > 0 else np.nan
 
-    t_plot = frame_ids.astype(np.float32) * frame_interval
+    t_plot = _frame_times_at(frame_ids, frame_interval, frame_times)
     return t_plot, pred_curve
 
 
@@ -1038,6 +1055,7 @@ def fit_constrained_exp_tail(
     switch_frame,
     I_switch,
     last_frame_index,
+    frame_times=None,
 ):
     """
     Fit a constrained exponential tail that *starts from a fixed value* I_switch:
@@ -1051,7 +1069,7 @@ def fit_constrained_exp_tail(
         return {"success": False}
 
     frame_ids_tail = np.arange(switch_frame, last_frame_index + 1, dtype=int)
-    t_local = (frame_ids_tail - switch_frame).astype(np.float32) * frame_interval
+    t_local = _frame_times_at(frame_ids_tail, frame_interval, frame_times, origin=switch_frame)
     y_tail = frap_curve[frame_ids_tail]
 
     def constrained_exp_local(t_loc, YM_local, k_local):
@@ -1088,6 +1106,7 @@ def build_combined_curve_and_cost(
     switch_frame,
     tail_fit,
     exp_last_eff,
+    frame_times=None,
 ):
     """
     Given:
@@ -1115,7 +1134,8 @@ def build_combined_curve_and_cost(
         I_switch = tail_fit["Y0"]
 
         frames_tail_all = np.arange(switch_frame, exp_last_eff + 1, dtype=int)
-        t_tail_all = (frames_tail_all - switch_frame).astype(np.float32) * frame_interval
+        t_tail_all = _frame_times_at(frames_tail_all, frame_interval, frame_times,
+                                     origin=switch_frame)
 
         def constrained_exp_all(t_loc):
             return YM_c - (YM_c - I_switch) * np.exp(-k_c * t_loc)
@@ -1249,6 +1269,7 @@ def plot_frap_separate(
     frame_ids_exp=None,
     return_array=False,
     droplet_label=None,
+    frame_times=None,
 ):
     """
     Plot FRAP data, PDE fit (only over PDE frame window), and exponential plateau fit
@@ -1256,7 +1277,7 @@ def plot_frap_separate(
     Returns image array if return_array=True, else saves to file.
     """
     T = len(frap_curve)
-    t_full = np.arange(T, dtype=np.float32) * frame_interval
+    t_full = _frame_times_at(np.arange(T), frame_interval, frame_times)
 
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.plot(t_full, frap_curve, "ko-", label="Data (fit ROI)")
@@ -1281,6 +1302,7 @@ def plot_frap_separate(
             frame_interval,
             dt_sim,
             dx,
+            frame_times=frame_times,
         )
         ax.plot(
             times_pde,
@@ -1296,7 +1318,7 @@ def plot_frap_separate(
         # Use frame_ids_exp if provided, otherwise calculate from exp_fit["t"]
         if frame_ids_exp is not None and len(frame_ids_exp) == len(y_exp):
             # Calculate time directly from frame indices: frame 1 is at frame_interval
-            t_exp_abs = frame_ids_exp.astype(np.float32) * frame_interval
+            t_exp_abs = _frame_times_at(frame_ids_exp, frame_interval, frame_times)
         else:
             # Fallback: exp_fit["t"] is relative to first post-bleach frame (t=0 at frame 1)
             t_exp_rel = exp_fit["t"]
@@ -1342,6 +1364,7 @@ def plot_frap_combined(
     out_path=None,
     return_array=False,
     droplet_label=None,
+    frame_times=None,
 ):
     """
     Plot FRAP data, PDE-only curve, and combined (PDE + constrained tail) model.
@@ -1352,7 +1375,7 @@ def plot_frap_combined(
     Returns image array if return_array=True, else saves to file.
     """
     T = len(frap_curve)
-    t_full = np.arange(T, dtype=np.float32) * frame_interval
+    t_full = _frame_times_at(np.arange(T), frame_interval, frame_times)
 
     dx = pixel_size_eff
     dt_stable = 0.24 * dx * dx / max(D_max, 1e-6)
@@ -1368,6 +1391,7 @@ def plot_frap_combined(
         frame_interval,
         dt_sim,
         dx,
+        frame_times=frame_times,
     )
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -1390,7 +1414,7 @@ def plot_frap_combined(
         )
 
     # T_switch vertical line at the *data* time for that frame
-    ax.axvline(T_switch_frame * frame_interval, color="gray",
+    ax.axvline(_frame_times_at([T_switch_frame], frame_interval, frame_times)[0], color="gray",
                linestyle=":", label="T_switch")
 
     ax.set_xlabel("Time (s)")
@@ -2499,11 +2523,9 @@ def process_movie(
         # This guarantees raw intensities are never lost and both normalizations are available.
         # Real per-frame time axis: use the resolved frame_times (variable acquisition
         # cadence) when provided, else the uniform frame_interval grid. First frame = 0.
-        if frame_times is not None and len(frame_times) >= T:
-            frame_times_arr = np.asarray(frame_times[:T], dtype=np.float64)
-            frame_times_arr = (frame_times_arr - frame_times_arr[0])
-        else:
-            frame_times_arr = np.arange(T, dtype=np.float64) * float(frame_interval)
+        frame_times_arr = resolve_frame_times(frame_times, T, frame_interval)
+        # Passed to the mixed-model helpers/plots; None keeps their uniform-grid path.
+        ft_axis = frame_times_arr if frame_times is not None else None
         times_full = frame_times_arr.astype(np.float32)
         ts_csv = os.path.join(summary_dir, f"{basename}{suff}_frap_timeseries.csv")
 
@@ -2708,6 +2730,7 @@ def process_movie(
             frame_ids_pde=frame_ids_pde,
             frame_ids_exp=frame_ids_exp_for_plot,
             droplet_label=basename,
+            frame_times=ft_axis,
         )
         if image_collector is not None and frap_sep_img is not None:
             image_collector.add_image("FRAP", "frap_fit_separate", frap_sep_img, basename)
@@ -2752,6 +2775,7 @@ def process_movie(
                     frame_interval,
                     dt_sim,
                     dx,
+                    frame_times=ft_axis,
                 )
 
                 # Candidate T_switch frames:
@@ -2793,6 +2817,7 @@ def process_movie(
                         T_sw,
                         I_switch,
                         last_frame_index=exp_last_eff,
+                        frame_times=ft_axis,
                     )
                     if not tail_fit.get("success", False):
                         continue
@@ -2805,6 +2830,7 @@ def process_movie(
                         T_sw,
                         tail_fit,
                         exp_last_eff,
+                        frame_times=ft_axis,
                     )
 
                     logger.debug(
@@ -2841,6 +2867,7 @@ def process_movie(
                         T_switch_best,
                         return_array=(image_collector is not None),
                         droplet_label=basename,
+                        frame_times=ft_axis,
                     )
                     if image_collector is not None and frap_comb_img is not None:
                         image_collector.add_image("FRAP", "frap_fit_combined", frap_comb_img, basename)
@@ -2880,29 +2907,47 @@ def _movie_of(curve_name):
     return s
 
 
+def read_frame_times_sidecar(results_dir):
+    """Read the raw ``time_s`` column of the ``*_frame_times.csv`` sidecar written by the
+    crop stage (only present for real timestamps or explicit timing segments). Returns
+    ``(times, path)``, or ``(None, None)`` if there is no usable sidecar."""
+    cands = sorted(glob.glob(os.path.join(results_dir, "*_frame_times.csv"))) if results_dir else []
+    if not cands:
+        return None, None
+    import pandas as pd
+    df = pd.read_csv(cands[0])
+    if "time_s" not in df.columns:
+        return None, None
+    tv = np.asarray(df["time_s"].to_numpy(), dtype=np.float64)
+    if len(tv) < 2 or not np.all(np.isfinite(tv)):
+        return None, None
+    return tv, cands[0]
+
+
+def resolve_frame_times(frame_times, T, frame_interval):
+    """Length-T time axis (s, float64, first element 0) from raw per-frame ``frame_times``.
+    A short axis is extended at its last spacing; ``None`` gives the uniform
+    ``arange(T) * frame_interval`` grid."""
+    if frame_times is None or len(frame_times) < 2:
+        return np.arange(T, dtype=np.float64) * float(frame_interval)
+    tv = np.asarray(frame_times, dtype=np.float64)
+    if len(tv) >= T:
+        tv = tv[:T]
+    else:
+        dt = tv[-1] - tv[-2]
+        tv = np.concatenate([tv, tv[-1] + np.arange(1, T - len(tv) + 1) * dt])
+    return tv - tv[0]
+
+
 def load_frame_times(results_dir, T, frame_interval):
-    """Load the per-frame time axis (seconds) from a ``*_frame_times.csv`` sidecar written
-    by the crop stage (variable acquisition cadence). Falls back to uniform
-    ``arange(T) * frame_interval`` when no sidecar is present, so uniform-timing movies are
-    unaffected. Always returns a length-T float array whose first element is 0."""
+    """Per-frame time axis (s) for a movie results folder: the ``*_frame_times.csv``
+    sidecar when present, else uniform ``arange(T) * frame_interval``. Always returns a
+    length-T float array whose first element is 0."""
     try:
-        cands = glob.glob(os.path.join(results_dir, "*_frame_times.csv")) if results_dir else []
-        if cands:
-            import pandas as pd
-            df = pd.read_csv(cands[0])
-            if "time_s" in df.columns:
-                tv = np.asarray(df["time_s"].to_numpy(), dtype=float)
-                if len(tv) >= T:
-                    tv = tv[:T]
-                elif len(tv) >= 2:
-                    dt = tv[-1] - tv[-2]
-                    tv = np.concatenate([tv, tv[-1] + np.arange(1, T - len(tv) + 1) * dt])
-                else:
-                    raise ValueError("sidecar too short")
-                return (tv - tv[0]).astype(np.float64)
+        tv, _ = read_frame_times_sidecar(results_dir)
     except Exception:
-        pass
-    return np.arange(T, dtype=np.float64) * float(frame_interval)
+        tv = None
+    return resolve_frame_times(tv, T, frame_interval)
 
 
 def write_normalization_stacked_csvs(timeseries_files, out_dir, normalization_method,
@@ -2981,6 +3026,14 @@ def write_normalization_stacked_csvs(timeseries_files, out_dir, normalization_me
                 if time_axis is None and "time_s" in df.columns:
                     time_axis = df["time_s"].to_numpy()
         if not series_by_name:
+            # Every curve was filtered out: drop a previous run's main outputs so they
+            # aren't mistaken for this run's.
+            if not name_suffix:
+                for stale in (fname, avg_map[method]):
+                    try:
+                        os.remove(os.path.join(out_dir, stale))
+                    except OSError:
+                        pass
             continue
         min_len = min(len(v) for v in series_by_name.values())
 
@@ -3098,7 +3151,8 @@ def consolidate_droplet_metrics(results_dir, summary_name="FRAP_condition_summar
     import pandas as pd
 
     def _key(s):
-        return os.path.splitext(os.path.basename(str(s)))[0]
+        # Two-channel rows carry a ``_chN`` suffix; geometry is keyed by the bare droplet.
+        return re.sub(r"_ch\d+$", "", os.path.splitext(os.path.basename(str(s)))[0])
 
     frames = []
     frap_path = os.path.join(results_dir, summary_name)
@@ -3110,6 +3164,9 @@ def consolidate_droplet_metrics(results_dir, summary_name="FRAP_condition_summar
                 df = df.drop(columns=["Models"])
             if "filename" in df.columns:
                 df["droplet_key"] = df["filename"].map(_key)
+                ch = df["filename"].astype(str).str.extract(r"_ch(\d+)$", expand=False)
+                if "channel" not in df.columns and ch.notna().any():
+                    df["channel"] = pd.to_numeric(ch, errors="coerce").astype("Int64")
                 df["droplet_class"] = "FRAP"
                 frames.append(df)
         except Exception as e:
@@ -3165,7 +3222,7 @@ def consolidate_droplet_metrics(results_dir, summary_name="FRAP_condition_summar
 
     # Order: identity + location/geometry first, then the rest.
     front = [c for c in [
-        "droplet_key", "droplet_class", "filename",
+        "droplet_key", "droplet_class", "filename", "channel",
         "centroid_x_px", "centroid_y_px", "area_px", "effective_radius_px",
         "equiv_diameter_px", "perimeter_px", "circularity", "eccentricity",
         "partition_coefficient",
@@ -3252,11 +3309,14 @@ def _write_condition_summary_csv(out_path, summaries_sep, summaries_comb, combin
 
 def _arithmetic_filter_names(summary_dir, candidate_names, normalization_method,
                              max_drop=0.1, max_jump=0.1, ignore_first_n=4,
-                             min_val=0.1, max_val=1.2, max_removed_frac=0.5):
+                             min_val=0.1, max_val=1.2, max_removed_frac=0.5,
+                             pre_bleach_frames=1):
     """Return the subset of ``candidate_names`` (movie/bleach-point names) whose reported
     FRAP recovery curve passes the arithmetic quality filters: no excessive frame-to-frame
     jump/drop and (optionally) values within range. Reads the per-movie timeseries CSVs in
-    ``summary_dir``.
+    ``summary_dir``. Only the post-bleach part of each curve (from frame
+    ``pre_bleach_frames``) is examined, so the bleach drop itself never counts;
+    ``ignore_first_n`` counts post-bleach frames.
 
     Safety guard: if the arithmetic thresholds would remove more than ``max_removed_frac``
     of the candidates, the thresholds are clearly ill-suited to this dataset -- the filter
@@ -3278,6 +3338,7 @@ def _arithmetic_filter_names(summary_dir, candidate_names, normalization_method,
     col = "FRAP_norm_prebleach" if nm in ("prebleach", "both") else "FRAP_norm_wholedroplet"
     alt = "FRAP_norm_wholedroplet" if col == "FRAP_norm_prebleach" else "FRAP_norm_prebleach"
 
+    first_post = max(1, int(pre_bleach_frames))
     curves = {}
     for name in candidate_names:
         f = os.path.join(summary_dir, f"{name}_frap_timeseries.csv")
@@ -3290,7 +3351,9 @@ def _arithmetic_filter_names(summary_dir, candidate_names, normalization_method,
         use = col if col in df.columns else (alt if alt in df.columns else None)
         if use is None:
             continue
-        curves[name] = np.asarray(df[use].to_numpy(), dtype=float)
+        post = np.asarray(df[use].to_numpy(), dtype=float)[first_post:]
+        if post.size:
+            curves[name] = post
 
     if not curves:
         return set(candidate_names)
@@ -3433,15 +3496,19 @@ def process_single_condition(
     # crop stage (variable acquisition cadence). None -> process_movie uses uniform timing.
     cond_frame_times = None
     try:
-        _ft_cands = glob.glob(os.path.join(results_dir, "*_frame_times.csv"))
-        if _ft_cands:
-            import pandas as _pd_ft
-            _ft_df = _pd_ft.read_csv(_ft_cands[0])
-            if "time_s" in _ft_df.columns:
-                cond_frame_times = np.asarray(_ft_df["time_s"].to_numpy(), dtype=float)
-                logger.info(f"Using variable frame-time axis from "
-                            f"{os.path.basename(_ft_cands[0])} ({len(cond_frame_times)} frames).")
+        cond_frame_times, ft_path = read_frame_times_sidecar(results_dir)
+        if cond_frame_times is not None:
+            logger.info(f"Using variable frame-time axis from "
+                        f"{os.path.basename(ft_path)} ({len(cond_frame_times)} frames).")
+            med_dt = float(np.median(np.diff(cond_frame_times)))
+            if frame_interval and abs(med_dt - frame_interval) > 0.05 * abs(frame_interval):
+                logger.warning(
+                    f"{os.path.basename(ft_path)}: median frame spacing {med_dt:.4g} s differs "
+                    f"from --frame-interval {frame_interval:.4g} s by >5%; using the sidecar "
+                    f"times for fitting (frame_interval_s column still reports "
+                    f"{frame_interval:.4g}).")
     except Exception as e:
+        cond_frame_times = None
         logger.warning(f"Could not read frame-times sidecar: {e}")
 
     # First pass: analyze control movies to obtain global photobleach curve
@@ -3756,7 +3823,8 @@ def process_single_condition(
                 summary_dir, candidate_names, normalization_method,
                 max_drop=arith_max_drop, max_jump=arith_max_jump,
                 ignore_first_n=arith_ignore_first_n,
-                min_val=arith_min_val, max_val=arith_max_val)
+                min_val=arith_min_val, max_val=arith_max_val,
+                pre_bleach_frames=pre_bleach_frames)
             before = len(all_summaries_sep)
             all_summaries_sep = [s for s in all_summaries_sep
                                  if s.get("filename", "") in kept_arith]
@@ -4084,7 +4152,8 @@ def main():
     parser.add_argument("--arith-max-jump", type=float, default=0.1,
                         help="Max allowed per-frame jump in the arithmetic filter (default 0.1).")
     parser.add_argument("--arith-ignore-first-n", type=int, default=4,
-                        help="Initial frames ignored by the arithmetic jump/drop filter (default 4).")
+                        help="Initial post-bleach frames ignored by the arithmetic jump/drop "
+                             "filter (default 4).")
     parser.add_argument("--arith-min-val", type=float, default=0.1,
                         help="Min allowed curve value in the arithmetic filter (default 0.1).")
     parser.add_argument("--arith-max-val", type=float, default=1.2,
@@ -4159,19 +4228,19 @@ def main():
     parser.add_argument("--crop-smooth-sigma", type=float, default=1.0)
     parser.add_argument("--crop-clear-borders", action="store_true")
     parser.add_argument("--crop-no-clear-borders", action="store_true")
-    parser.add_argument("--crop-ratio-blur-sigma", type=float, default=0.7)
+    parser.add_argument("--crop-ratio-blur-sigma", type=float, default=2.0)
     parser.add_argument("--crop-bleach-threshold", type=float, default=1.2)
     parser.add_argument("--crop-crop-multiplier", type=float, default=2.0)
-    parser.add_argument("--crop-max-iterations", type=int, default=2000)
-    parser.add_argument("--crop-epsilon", type=float, default=1e-10)
+    parser.add_argument("--crop-max-iterations", type=int, default=500)
+    parser.add_argument("--crop-epsilon", type=float, default=1e-7)
     parser.add_argument("--crop-pyramid-levels", type=int, default=4)
-    parser.add_argument("--crop-template-update-coeff", type=float, default=0.99)
-    parser.add_argument("--crop-pre-smooth-sigma", type=float, default=0.5)
+    parser.add_argument("--crop-template-update-coeff", type=float, default=0.95)
+    parser.add_argument("--crop-pre-smooth-sigma", type=float, default=1.0)
     parser.add_argument("--crop-max-shift-pixels", type=float, default=25.0)
     parser.add_argument("--crop-min-correlation", type=float, default=0.8)
     parser.add_argument("--crop-refine-iterations", type=int, default=20)
-    parser.add_argument("--crop-min-nobleach-diameter", type=float, default=10.0)
-    parser.add_argument("--crop-min-nobleach-pc", type=float, default=5.0)
+    parser.add_argument("--crop-min-nobleach-diameter", type=float, default=0.0)
+    parser.add_argument("--crop-min-nobleach-pc", type=float, default=0.0)
     parser.add_argument("--crop-n-jobs", type=int, default=8)
     parser.add_argument("--crop-stabilize", action="store_true",
                         help="Enable stabilization during cropping (default off).")
@@ -4181,6 +4250,9 @@ def main():
                              "(only used if crop_pde runs droplet_crop on raw ND2s).")
     parser.add_argument("--crop-quiet", action="store_true",
                         help="Suppress per-droplet logging during cropping.")
+    parser.add_argument("--timing-segments", type=str, default="",
+                        help="Variable acquisition timing for the internal crop pass-through, "
+                             "e.g. '300x0.1,35x10' (used when ND2 timestamps are absent).")
 
     # Verbosity
     parser.add_argument("-v", "--verbose", action="count", default=1,
@@ -4258,7 +4330,13 @@ def main():
             "--min-nobleach-diameter", str(args.crop_min_nobleach_diameter),
             "--min-nobleach-pc", str(args.crop_min_nobleach_pc),
             "--n-jobs", str(args.crop_n_jobs),
+            "--pixel-size", str(pixel_size),
+            "--frame-interval", str(frame_interval),
+            "--pre-bleach-frames", str(args.pre_bleach_frames),
+            "--analysis-channel", str(args.analysis_channel),
         ]
+        if args.timing_segments:
+            cmd.append(f"--timing-segments={args.timing_segments}")
         if args.crop_clear_borders:
             cmd.append("--clear-borders")
         if args.crop_no_clear_borders:

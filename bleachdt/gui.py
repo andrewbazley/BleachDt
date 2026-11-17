@@ -201,6 +201,77 @@ except ImportError:
     )
 
 
+def build_droplet_crop_cmd(script_path, input_dir, output_root, p):
+    """Build the droplet_crop.py argv from a GUI parameter dict.
+
+    Shared by "Crop Only" and the full pipeline so both crop identically.
+    """
+    cmd = [
+        sys.executable, script_path,
+        input_dir,
+        "--output-root", output_root,
+        "--min-area", str(p.get('crop_min_area', 50.0)),
+        "--pre-bleach-frames", str(p.get('pre_bleach_frames', 1)),
+        "--analysis-channel", str(p.get('analysis_channel', 1)),
+        "--morph-open-radius", str(p.get('crop_morph_open_radius', 1)),
+        "--smooth-sigma", str(p.get('crop_smooth_sigma', 1.0)),
+        # 8-bit detection image + physically-sized (micron) pre-threshold blur
+        "--pixel-size", str(p.get('pixel_size', 0.11)),
+        "--detect-blur-um", str(p.get('detect_blur_um', 1.0)),
+        "--ratio-blur-sigma", str(p.get('crop_ratio_blur_sigma', 2.0)),
+        "--bleach-threshold", str(p.get('crop_bleach_threshold', 1.2)),
+        "--crop-multiplier", str(p.get('crop_crop_multiplier', 2.0)),
+        "--min-diameter", str(p.get('crop_min_nobleach_diameter', 0.0)),
+        "--min-pc", str(p.get('crop_min_nobleach_pc', 0.0)),
+        "--bleach-spot-min-area", str(p.get('crop_bleach_spot_min_area', 5.0)),
+        "--min-bleach-depth", str(p.get('crop_min_bleach_depth', 0.3)),
+        "--frame-interval", str(p.get('frame_interval', 10.0)),
+        "--n-jobs", str(p.get('crop_n_jobs', 8)),
+        # Frame-range stabilization (aligned to frame 0, applied to whole stack)
+        "--stabilize-frame-start", str(p.get('stabilize_frame_start', 0)),
+        "--stabilize-frame-end", str(p.get('stabilize_frame_end', -1)),
+        "--stabilize-extrapolation", str(p.get('stabilize_extrapolation', 'hold')),
+        # Stabilization parameters
+        "--pyramid-levels", str(p.get('stab_pyramid_levels', 4)),
+        "--max-iterations", str(p.get('stab_max_iterations', 500)),
+        "--epsilon", str(p.get('stab_epsilon', 1e-7)),
+        "--template-update-coeff", str(p.get('stab_template_update_coeff', 0.95)),
+        "--pre-smooth-sigma", str(p.get('stab_pre_smooth_sigma', 1.0)),
+        "--max-shift-pixels", str(p.get('stab_max_shift_pixels', 25.0)),
+        "--min-correlation", str(p.get('stab_min_correlation', 0.8)),
+        "--refine-iterations", str(p.get('stab_refine_iterations', 20)),
+    ]
+
+    if p.get('save_threshold_masks', False):
+        cmd.append("--save-threshold-masks")
+
+    if not p.get('stabilize_enabled', True):
+        cmd.append("--no-stabilize")
+    else:
+        cmd.extend(["--stabilize-algorithm", p.get('stabilize_algorithm', 'lucas-kanade')])
+        # Subpixel drift application is the default; opt in to whole-pixel
+        # (exact-intensity-preserving) application only when requested.
+        if p.get('whole_pixel_stabilization', False):
+            cmd.append("--whole-pixel-stabilization")
+
+    # Clear borders (default OFF now: keep every droplet, including edge-touching)
+    if p.get('crop_clear_borders', False):
+        cmd.append("--clear-borders")
+    else:
+        cmd.append("--no-clear-borders")
+
+    # Variable acquisition timing (e.g. "300x0.1,35x10"); metadata is tried first.
+    # Joined with '=' so a value starting with '-' is not parsed as an option.
+    timing = str(p.get('timing_segments', '') or '').strip()
+    if timing:
+        cmd.append(f"--timing-segments={timing}")
+
+    if p.get('quiet', False):
+        cmd.append("--quiet")
+
+    return cmd
+
+
 class DropletCropWorker(QThread):
     """Worker thread for running droplet_crop.py to crop and save droplet stacks."""
     finished = Signal(bool, str)
@@ -226,47 +297,9 @@ class DropletCropWorker(QThread):
             # New structure: droplet stacks go inside Analysis Results/[movie]_results/droplet_stacks/
             results_root = os.path.join(self.input_dir, "Analysis Results")
             droplet_root = p.get('droplet_images_root') or results_root
-            
-            cmd = [
-                sys.executable, script_path,
-                self.input_dir,
-                "--output-root", droplet_root,
-                "--min-area", str(p.get('min_area', 50.0)),
-                "--morph-open-radius", str(p.get('morph_open_radius', 1)),
-                "--smooth-sigma", str(p.get('smooth_sigma', 1.0)),
-                "--ratio-blur-sigma", str(p.get('ratio_blur_sigma', 2.0)),
-                "--bleach-threshold", str(p.get('bleach_threshold', 1.2)),
-                "--crop-multiplier", str(p.get('crop_multiplier', 2.0)),
-                "--max-iterations", str(p.get('max_iterations', 2000)),
-                "--epsilon", str(p.get('epsilon', 1e-10)),
-                "--pyramid-levels", str(p.get('pyramid_levels', 4)),
-                "--template-update-coeff", str(p.get('template_update_coeff', 0.99)),
-                "--pre-smooth-sigma", str(p.get('pre_smooth_sigma', 0.5)),
-                "--max-shift-pixels", str(p.get('max_shift_pixels', 25.0)),
-                "--min-correlation", str(p.get('min_correlation', 0.8)),
-                "--refine-iterations", str(p.get('refine_iterations', 20)),
-                "--min-diameter", str(p.get('min_nobleach_diameter', 10.0)),
-                "--min-pc", str(p.get('min_nobleach_pc', 5.0)),
-                "--min-bleach-depth", str(p.get('min_bleach_depth', 0.3)),
-                "--pixel-size", str(p.get('pixel_size', 0.11)),
-                "--detect-blur-um", str(p.get('detect_blur_um', 1.0)),
-                "--n-jobs", str(p.get('n_jobs', 8)),
-            ]
-            
-            if p.get('clear_borders', True):
-                cmd.append("--clear-borders")
-            else:
-                cmd.append("--no-clear-borders")
-            
-            if not p.get('stabilize', True):
-                cmd.append("--no-stabilize")
 
-            if p.get('save_threshold_masks', False):
-                cmd.append("--save-threshold-masks")
+            cmd = build_droplet_crop_cmd(script_path, self.input_dir, droplet_root, p)
 
-            if p.get('quiet', False):
-                cmd.append("--quiet")
-            
             self.progress.emit("Running Droplet Crop pipeline...")
             self.progress.emit(f"Command: {' '.join(cmd)}\n")
             
@@ -353,67 +386,7 @@ class FullAnalysisWorker(QThread):
                     self.finished.emit(False, f"droplet_crop.py not found at {crop_script_path}")
                     return
                 
-                # Build droplet_crop.py command
-                crop_cmd = [
-                    sys.executable, crop_script_path,
-                    self.input_dir,
-                    "--output-root", results_root,
-                    "--min-area", str(p.get('crop_min_area', 50.0)),
-                    "--pre-bleach-frames", str(p.get('pre_bleach_frames', 1)),
-                    "--analysis-channel", str(p.get('analysis_channel', 1)),
-                    "--morph-open-radius", str(p.get('crop_morph_open_radius', 1)),
-                    "--smooth-sigma", str(p.get('crop_smooth_sigma', 1.0)),
-                    # 8-bit detection image + physically-sized (micron) pre-threshold blur
-                    "--pixel-size", str(p.get('pixel_size', 0.11)),
-                    "--detect-blur-um", str(p.get('detect_blur_um', 1.0)),
-                    "--ratio-blur-sigma", str(p.get('crop_ratio_blur_sigma', 2.0)),
-                    "--bleach-threshold", str(p.get('crop_bleach_threshold', 1.2)),
-                    "--crop-multiplier", str(p.get('crop_crop_multiplier', 2.0)),
-                    "--min-diameter", str(p.get('crop_min_nobleach_diameter', 0.0)),
-                    "--min-pc", str(p.get('crop_min_nobleach_pc', 0.0)),
-                    "--bleach-spot-min-area", str(p.get('crop_bleach_spot_min_area', 5.0)),
-                    "--min-bleach-depth", str(p.get('crop_min_bleach_depth', 0.3)),
-                    "--frame-interval", str(p.get('frame_interval', 10.0)),
-                    "--n-jobs", str(p.get('crop_n_jobs', 8)),
-                    # Frame-range stabilization (aligned to frame 0, applied to whole stack)
-                    "--stabilize-frame-start", str(p.get('stabilize_frame_start', 0)),
-                    "--stabilize-frame-end", str(p.get('stabilize_frame_end', -1)),
-                    "--stabilize-extrapolation", str(p.get('stabilize_extrapolation', 'hold')),
-                    # Stabilization parameters
-                    "--pyramid-levels", str(p.get('stab_pyramid_levels', 4)),
-                    "--max-iterations", str(p.get('stab_max_iterations', 1000)),
-                    "--epsilon", str(p.get('stab_epsilon', 1e-8)),
-                    "--template-update-coeff", str(p.get('stab_template_update_coeff', 0.90)),
-                    "--pre-smooth-sigma", str(p.get('stab_pre_smooth_sigma', 0.5)),
-                    "--max-shift-pixels", str(p.get('stab_max_shift_pixels', 25.0)),
-                    "--min-correlation", str(p.get('stab_min_correlation', 0.8)),
-                    "--refine-iterations", str(p.get('stab_refine_iterations', 20)),
-                ]
-                
-                if p.get('save_threshold_masks', False):
-                    crop_cmd.append("--save-threshold-masks")
-
-                # Stabilization options
-                if not p.get('stabilize_enabled', True):
-                    crop_cmd.append("--no-stabilize")
-                else:
-                    stab_algo = p.get('stabilize_algorithm', 'lucas-kanade')
-                    crop_cmd.extend(["--stabilize-algorithm", stab_algo])
-                    # Subpixel drift application is the default; opt in to whole-pixel
-                    # (exact-intensity-preserving) application only when requested.
-                    if p.get('whole_pixel_stabilization', False):
-                        crop_cmd.append("--whole-pixel-stabilization")
-
-                # Clear borders (default OFF now: keep every droplet, including edge-touching)
-                if p.get('crop_clear_borders', False):
-                    crop_cmd.append("--clear-borders")
-                else:
-                    crop_cmd.append("--no-clear-borders")
-
-                # Variable acquisition timing (e.g. "300x0.1,35x10"); metadata is tried first.
-                _timing = str(p.get('timing_segments', '') or '').strip()
-                if _timing:
-                    crop_cmd.extend(["--timing-segments", _timing])
+                crop_cmd = build_droplet_crop_cmd(crop_script_path, self.input_dir, results_root, p)
 
                 self.progress.emit(f"Running droplet_crop.py on {total_movies} movies...")
                 self.progress.emit(f"Command: {' '.join(crop_cmd)}\n")
@@ -567,22 +540,22 @@ class FullAnalysisWorker(QThread):
                     "--crop-ratio-blur-sigma", str(p.get('crop_ratio_blur_sigma', 2.0)),
                     "--crop-bleach-threshold", str(p.get('crop_bleach_threshold', 1.2)),
                     "--crop-crop-multiplier", str(p.get('crop_crop_multiplier', 2.0)),
-                    "--crop-max-iterations", str(p.get('crop_max_iterations', 2000)),
-                    "--crop-epsilon", str(p.get('crop_epsilon', 1e-10)),
-                    "--crop-pyramid-levels", str(p.get('crop_pyramid_levels', 4)),
-                    "--crop-template-update-coeff", str(p.get('crop_template_update_coeff', 0.99)),
-                    "--crop-pre-smooth-sigma", str(p.get('crop_pre_smooth_sigma', 0.5)),
-                    "--crop-max-shift-pixels", str(p.get('crop_max_shift_pixels', 25.0)),
-                    "--crop-min-correlation", str(p.get('crop_min_correlation', 0.8)),
-                    "--crop-refine-iterations", str(p.get('crop_refine_iterations', 20)),
-                    "--crop-min-nobleach-diameter", str(p.get('crop_min_nobleach_diameter', 10.0)),
-                    "--crop-min-nobleach-pc", str(p.get('crop_min_nobleach_pc', 5.0)),
+                    "--crop-max-iterations", str(p.get('stab_max_iterations', 500)),
+                    "--crop-epsilon", str(p.get('stab_epsilon', 1e-7)),
+                    "--crop-pyramid-levels", str(p.get('stab_pyramid_levels', 4)),
+                    "--crop-template-update-coeff", str(p.get('stab_template_update_coeff', 0.95)),
+                    "--crop-pre-smooth-sigma", str(p.get('stab_pre_smooth_sigma', 1.0)),
+                    "--crop-max-shift-pixels", str(p.get('stab_max_shift_pixels', 25.0)),
+                    "--crop-min-correlation", str(p.get('stab_min_correlation', 0.8)),
+                    "--crop-refine-iterations", str(p.get('stab_refine_iterations', 20)),
+                    "--crop-min-nobleach-diameter", str(p.get('crop_min_nobleach_diameter', 0.0)),
+                    "--crop-min-nobleach-pc", str(p.get('crop_min_nobleach_pc', 0.0)),
                     "--crop-n-jobs", str(p.get('crop_n_jobs', 8)),
                 ])
                 if p.get('stabilize_enabled', True):
                     cmd.append("--crop-stabilize")
                     cmd.extend(["--crop-stabilize-algorithm", p.get('stabilize_algorithm', 'lucas-kanade')])
-                if p.get('crop_clear_borders', True):
+                if p.get('crop_clear_borders', False):
                     cmd.append("--crop-clear-borders")
                 else:
                     cmd.append("--crop-no-clear-borders")
@@ -3132,9 +3105,10 @@ class AnalysisTab(QWidget):
 
         stab_row2.addWidget(QLabel("Error Tolerance:"))
         self.stab_epsilon_spin = QDoubleSpinBox()
+        # Decimals first: range and value are rounded to the current precision.
+        self.stab_epsilon_spin.setDecimals(10)
         self.stab_epsilon_spin.setRange(1e-12, 1e-4)
         self.stab_epsilon_spin.setValue(1e-7)
-        self.stab_epsilon_spin.setDecimals(10)
         self.stab_epsilon_spin.setSingleStep(1e-9)
         self.stab_epsilon_spin.setToolTip("Convergence threshold (lower = stricter)")
         stab_row2.addWidget(self.stab_epsilon_spin)
@@ -3638,19 +3612,43 @@ class AnalysisTab(QWidget):
         self.setLayout(main_layout)
     
     def _get_crop_params(self):
-        """Get parameters for droplet_crop.py."""
+        """Get parameters for droplet_crop.py (shared by Crop Only and the full pipeline)."""
+        # "Gradient (recommended)" routes through the gradient-domain registration
+        # (lucas-kanade flag); only "ECC" selects the ECC path.
+        use_ecc = self.stabilize_algorithm_combo.currentText().strip().upper().startswith("ECC")
         return {
-            'min_area': self.crop_min_area_spin.value(),
-            'bleach_threshold': self.crop_bleach_thresh_spin.value(),
-            'crop_multiplier': self.crop_multiplier_spin.value(),
-            'min_nobleach_diameter': self.crop_min_nb_diam_spin.value(),
-            'min_nobleach_pc': self.crop_min_nb_pc_spin.value(),
-            'min_bleach_depth': self.crop_min_bleach_depth_spin.value(),
-            'save_threshold_masks': self.save_threshold_qc_check.isChecked(),
             'pixel_size': self.pixel_size_spin.value(),
-            'n_jobs': self.crop_n_jobs_spin.value(),
-            'stabilize': self.stabilize_check.isChecked(),
-            'clear_borders': self.crop_clear_borders_check.isChecked(),
+            'frame_interval': self.frame_interval_spin.value(),
+            'pre_bleach_frames': self.pre_bleach_frames_spin.value(),
+            'analysis_channel': self.analysis_channel_combo.currentIndex() + 1,
+            'timing_segments': self.timing_segments_edit.text().strip(),
+            # Stabilization
+            'stabilize_enabled': self.stabilize_check.isChecked(),
+            'stabilize_algorithm': 'ecc' if use_ecc else 'lucas-kanade',
+            # Stabilization always uses subpixel application from the GUI.
+            'whole_pixel_stabilization': False,
+            'stabilize_frame_start': self.stab_frame_start_spin.value(),
+            'stabilize_frame_end': self.stab_frame_end_spin.value(),
+            'stabilize_extrapolation': self.stab_extrapolation_combo.currentText(),
+            'stab_pyramid_levels': self.stab_pyramid_spin.value(),
+            'stab_max_iterations': self.stab_iterations_spin.value(),
+            'stab_epsilon': self.stab_epsilon_spin.value(),
+            'stab_template_update_coeff': self.stab_template_coeff_spin.value(),
+            'stab_pre_smooth_sigma': self.stab_pre_smooth_spin.value(),
+            'stab_max_shift_pixels': self.stab_max_shift_spin.value(),
+            'stab_min_correlation': self.stab_min_corr_spin.value(),
+            'stab_refine_iterations': self.stab_refine_spin.value(),
+            # Detection and cropping
+            'crop_clear_borders': self.crop_clear_borders_check.isChecked(),
+            'crop_min_area': self.crop_min_area_spin.value(),
+            'crop_bleach_threshold': self.crop_bleach_thresh_spin.value(),
+            'crop_crop_multiplier': self.crop_multiplier_spin.value(),
+            'crop_min_nobleach_diameter': self.crop_min_nb_diam_spin.value(),
+            'crop_min_nobleach_pc': self.crop_min_nb_pc_spin.value(),
+            'crop_bleach_spot_min_area': self.crop_bleach_spot_min_area_spin.value(),
+            'crop_min_bleach_depth': self.crop_min_bleach_depth_spin.value(),
+            'save_threshold_masks': self.save_threshold_qc_check.isChecked(),
+            'crop_n_jobs': self.crop_n_jobs_spin.value(),
             'quiet': False,
         }
     
@@ -3797,7 +3795,6 @@ class AnalysisTab(QWidget):
         n_jobs = multiprocessing.cpu_count()  # Use all available cores by default
         
         # Get droplet detection parameters
-        pixel_size = self.pixel_size_spin.value()
         frame_interval = self.frame_interval_spin.value()
         droplet_min_size = self.droplet_min_size_spin.value()
         ratio_percentile = self.ratio_percentile_spin.value()
@@ -3835,18 +3832,10 @@ class AnalysisTab(QWidget):
             else:
                 self.log_text.append("Detected cropped TIF files. Starting analysis pipeline...\n")
             
-            # Build params dict for the worker using all GUI parameters
-            # Determine stabilization algorithm
-            stab_algo = self.stabilize_algorithm_combo.currentText()
-            # "Gradient (recommended)" routes through the gradient-domain registration
-            # (use_lucas_kanade flag); only "ECC" selects the ECC path.
-            use_lucas_kanade = not stab_algo.strip().upper().startswith("ECC")
-            
-            params = {
-                'pixel_size': pixel_size,
-                'frame_interval': frame_interval,
-                'pre_bleach_frames': self.pre_bleach_frames_spin.value(),
-                'analysis_channel': self.analysis_channel_combo.currentIndex() + 1,
+            # Build params dict for the worker: shared droplet_crop parameters plus
+            # the fitting options only crop_pde.py uses.
+            params = self._get_crop_params()
+            params.update({
                 'two_channel': self.two_channel_check.isChecked(),
                 'save_frap_fit_separate': self.save_frap_fit_check.isChecked(),
                 'save_k_exp_scatters': self.save_k_exp_scatters_check.isChecked(),
@@ -3888,41 +3877,13 @@ class AnalysisTab(QWidget):
                     self.pde_fitting_check.isChecked() and self.mixed_model_check.isChecked()
                 ),
                 'verbosity': 1,
-                # Stabilization parameters
-                'stabilize_enabled': self.stabilize_check.isChecked(),
-                'stabilize_algorithm': 'lucas-kanade' if use_lucas_kanade else 'ecc',
-                # Stabilization always uses subpixel application from the GUI.
-                'whole_pixel_stabilization': False,
-                'stab_pyramid_levels': self.stab_pyramid_spin.value(),
-                'stab_max_iterations': self.stab_iterations_spin.value(),
-                'stab_epsilon': self.stab_epsilon_spin.value(),
-                'stab_template_update_coeff': self.stab_template_coeff_spin.value(),
-                'stab_pre_smooth_sigma': self.stab_pre_smooth_spin.value(),
-                'stab_max_shift_pixels': self.stab_max_shift_spin.value(),
-                'stab_min_correlation': self.stab_min_corr_spin.value(),
-                'stab_refine_iterations': self.stab_refine_spin.value(),
                 # Droplet crop pass-through
                 'run_droplet_crop': self.run_droplet_crop_check.isChecked(),
-                'crop_clear_borders': self.crop_clear_borders_check.isChecked(),
-                'crop_min_area': self.crop_min_area_spin.value(),
-                'crop_bleach_threshold': self.crop_bleach_thresh_spin.value(),
-                'crop_crop_multiplier': self.crop_multiplier_spin.value(),
-                'crop_min_nobleach_diameter': self.crop_min_nb_diam_spin.value(),
-                'crop_min_nobleach_pc': self.crop_min_nb_pc_spin.value(),
-                'crop_bleach_spot_min_area': self.crop_bleach_spot_min_area_spin.value(),
-                'crop_min_bleach_depth': self.crop_min_bleach_depth_spin.value(),
                 'bleach_depth': self.crop_min_bleach_depth_spin.value(),
-                'save_threshold_masks': self.save_threshold_qc_check.isChecked(),
-                'crop_n_jobs': self.crop_n_jobs_spin.value(),
-                # Variable timing + frame-range stabilization
-                'timing_segments': self.timing_segments_edit.text().strip(),
-                'stabilize_frame_start': self.stab_frame_start_spin.value(),
-                'stabilize_frame_end': self.stab_frame_end_spin.value(),
-                'stabilize_extrapolation': self.stab_extrapolation_combo.currentText(),
                 # Flag to indicate raw movies need full processing
                 'has_raw_movies': has_raw_movies,
                 'raw_movie_files': raw_movie_files if has_raw_movies else [],
-            }
+            })
             self.worker = FullAnalysisWorker(input_dir, params)
             # Connect progress_update for determinate progress bar
             self.worker.progress_update.connect(self.update_progress_bar)
@@ -3969,6 +3930,10 @@ class AnalysisTab(QWidget):
             'imaging_parameters': {
                 'pixel_size': self.pixel_size_spin.value(),
                 'frame_interval': self.frame_interval_spin.value(),
+                'pre_bleach_frames': self.pre_bleach_frames_spin.value(),
+                'analysis_channel': self.analysis_channel_combo.currentIndex() + 1,
+                'two_channel': self.two_channel_check.isChecked(),
+                'timing_segments': self.timing_segments_edit.text().strip(),
             },
             'stabilization_parameters': {
                 'stabilize': self.stabilize_check.isChecked(),
@@ -3981,6 +3946,9 @@ class AnalysisTab(QWidget):
                 'max_shift_pixels': self.stab_max_shift_spin.value(),
                 'min_correlation': self.stab_min_corr_spin.value(),
                 'refine_iterations': self.stab_refine_spin.value(),
+                'frame_start': self.stab_frame_start_spin.value(),
+                'frame_end': self.stab_frame_end_spin.value(),
+                'extrapolation': self.stab_extrapolation_combo.currentText(),
             },
             'crop_parameters': {
                 'run_droplet_crop': self.run_droplet_crop_check.isChecked(),
@@ -3992,6 +3960,9 @@ class AnalysisTab(QWidget):
                 'min_nobleach_diameter': self.crop_min_nb_diam_spin.value(),
                 'min_nobleach_pc': self.crop_min_nb_pc_spin.value(),
                 'n_jobs': self.crop_n_jobs_spin.value(),
+                'min_bleach_depth': self.crop_min_bleach_depth_spin.value(),
+                'bleach_spot_min_area': self.crop_bleach_spot_min_area_spin.value(),
+                'save_threshold_masks': self.save_threshold_qc_check.isChecked(),
             },
             'pde_parameters': {
                 'd_min': self.d_min_spin.value(),
@@ -4022,6 +3993,11 @@ class AnalysisTab(QWidget):
             },
             'output_parameters': {
                 'pool_filtered': self.pool_filtered_check.isChecked(),
+                'normalization_method': self.normalization_method_combo.currentText(),
+                'save_frap_fit_separate': self.save_frap_fit_check.isChecked(),
+                'save_k_exp_scatters': self.save_k_exp_scatters_check.isChecked(),
+                'save_noise_pixels': self.save_noise_pixels_check.isChecked(),
+                'save_nobleach_k_curves': self.save_nobleach_k_check.isChecked(),
             },
             'visual_filter_parameters': {},
             'log_output': self.log_text.toPlainText()
@@ -4052,6 +4028,10 @@ class AnalysisTab(QWidget):
             'imaging_parameters': {
                 'pixel_size': self.pixel_size_spin.value(),
                 'frame_interval': self.frame_interval_spin.value(),
+                'pre_bleach_frames': self.pre_bleach_frames_spin.value(),
+                'analysis_channel': self.analysis_channel_combo.currentIndex() + 1,
+                'two_channel': self.two_channel_check.isChecked(),
+                'timing_segments': self.timing_segments_edit.text().strip(),
             },
             'stabilization_parameters': {
                 'stabilize': self.stabilize_check.isChecked(),
@@ -4064,6 +4044,9 @@ class AnalysisTab(QWidget):
                 'max_shift_pixels': self.stab_max_shift_spin.value(),
                 'min_correlation': self.stab_min_corr_spin.value(),
                 'refine_iterations': self.stab_refine_spin.value(),
+                'frame_start': self.stab_frame_start_spin.value(),
+                'frame_end': self.stab_frame_end_spin.value(),
+                'extrapolation': self.stab_extrapolation_combo.currentText(),
             },
             'crop_parameters': {
                 'run_droplet_crop': self.run_droplet_crop_check.isChecked(),
@@ -4075,6 +4058,9 @@ class AnalysisTab(QWidget):
                 'min_nobleach_diameter': self.crop_min_nb_diam_spin.value(),
                 'min_nobleach_pc': self.crop_min_nb_pc_spin.value(),
                 'n_jobs': self.crop_n_jobs_spin.value(),
+                'min_bleach_depth': self.crop_min_bleach_depth_spin.value(),
+                'bleach_spot_min_area': self.crop_bleach_spot_min_area_spin.value(),
+                'save_threshold_masks': self.save_threshold_qc_check.isChecked(),
             },
             'pde_parameters': {
                 'd_min': self.d_min_spin.value(),
@@ -4105,6 +4091,11 @@ class AnalysisTab(QWidget):
             },
             'output_parameters': {
                 'pool_filtered': self.pool_filtered_check.isChecked(),
+                'normalization_method': self.normalization_method_combo.currentText(),
+                'save_frap_fit_separate': self.save_frap_fit_check.isChecked(),
+                'save_k_exp_scatters': self.save_k_exp_scatters_check.isChecked(),
+                'save_noise_pixels': self.save_noise_pixels_check.isChecked(),
+                'save_nobleach_k_curves': self.save_nobleach_k_check.isChecked(),
             },
             'filtering_tab_filters': {}
         }
@@ -4145,6 +4136,12 @@ class AnalysisTab(QWidget):
                     ip = config['imaging_parameters']
                     self.pixel_size_spin.setValue(ip.get('pixel_size', 0.11))
                     self.frame_interval_spin.setValue(ip.get('frame_interval', 10.0))
+                    self.pre_bleach_frames_spin.setValue(ip.get('pre_bleach_frames', 1))
+                    self.analysis_channel_combo.setCurrentIndex(
+                        max(0, min(int(ip.get('analysis_channel', 1)) - 1,
+                                   self.analysis_channel_combo.count() - 1)))
+                    self.two_channel_check.setChecked(ip.get('two_channel', False))
+                    self.timing_segments_edit.setText(ip.get('timing_segments', ''))
                 
                 # Restore stabilization parameters
                 if 'stabilization_parameters' in config:
@@ -4161,6 +4158,10 @@ class AnalysisTab(QWidget):
                     self.stab_max_shift_spin.setValue(sp.get('max_shift_pixels', 25.0))
                     self.stab_min_corr_spin.setValue(sp.get('min_correlation', 0.8))
                     self.stab_refine_spin.setValue(sp.get('refine_iterations', 20))
+                    self.stab_frame_start_spin.setValue(sp.get('frame_start', 0))
+                    self.stab_frame_end_spin.setValue(sp.get('frame_end', -1))
+                    idx = self.stab_extrapolation_combo.findText(sp.get('extrapolation', 'hold'))
+                    self.stab_extrapolation_combo.setCurrentIndex(max(idx, 0))
                 
                 # Restore crop parameters
                 if 'crop_parameters' in config:
@@ -4171,9 +4172,12 @@ class AnalysisTab(QWidget):
                     self.crop_min_area_spin.setValue(cp.get('min_area', 50.0))
                     self.crop_bleach_thresh_spin.setValue(cp.get('bleach_threshold', 1.2))
                     self.crop_multiplier_spin.setValue(cp.get('crop_multiplier', 2.0))
-                    self.crop_min_nb_diam_spin.setValue(cp.get('min_nobleach_diameter', 10.0))
-                    self.crop_min_nb_pc_spin.setValue(cp.get('min_nobleach_pc', 5.0))
+                    self.crop_min_nb_diam_spin.setValue(cp.get('min_nobleach_diameter', 0.0))
+                    self.crop_min_nb_pc_spin.setValue(cp.get('min_nobleach_pc', 0.0))
                     self.crop_n_jobs_spin.setValue(cp.get('n_jobs', 8))
+                    self.crop_min_bleach_depth_spin.setValue(cp.get('min_bleach_depth', 0.3))
+                    self.crop_bleach_spot_min_area_spin.setValue(cp.get('bleach_spot_min_area', 5.0))
+                    self.save_threshold_qc_check.setChecked(cp.get('save_threshold_masks', False))
                 
                 # Restore PDE parameters
                 if 'pde_parameters' in config:
@@ -4232,6 +4236,13 @@ class AnalysisTab(QWidget):
                 if 'output_parameters' in config:
                     op = config['output_parameters']
                     self.pool_filtered_check.setChecked(op.get('pool_filtered', False))
+                    idx = self.normalization_method_combo.findText(op.get('normalization_method', ''))
+                    if idx >= 0:
+                        self.normalization_method_combo.setCurrentIndex(idx)
+                    self.save_frap_fit_check.setChecked(op.get('save_frap_fit_separate', False))
+                    self.save_k_exp_scatters_check.setChecked(op.get('save_k_exp_scatters', False))
+                    self.save_noise_pixels_check.setChecked(op.get('save_noise_pixels', False))
+                    self.save_nobleach_k_check.setChecked(op.get('save_nobleach_k_curves', True))
                 
                 # Restore filtering tab filters
                 if 'filtering_tab_filters' in config and self.main_window and hasattr(self.main_window, 'filtering_tab'):
